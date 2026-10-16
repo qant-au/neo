@@ -873,7 +873,8 @@ body.paged #paper:not(.script) #tp-author { font-size: calc(14px * var(--page-zo
    shaded; the caret steps over it whole, a click opens it to edit */
 .chapter-body .math {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-  font-size: 0.86em; padding: 0 0.25em; border-radius: 3px; cursor: text; white-space: pre-wrap;
+  font-size: 0.86em; padding: 0 0.25em; border-radius: 3px; cursor: text;
+  white-space: pre; /* a formula moves to the next line whole, never split mid-way */
   background: color-mix(in srgb, currentColor 8%, transparent);
 }
 /* cap-off while the caret is in the first paragraph: the rule must stop
