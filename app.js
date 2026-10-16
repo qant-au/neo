@@ -595,7 +595,7 @@ function countWords(text) {
 // A copy of a chapter without the marks that aren't words. A chapter on the
 // page is copied node for node: writing it out as HTML and reading it back
 // costs twice as much and gives the same tree.
-const UNCOUNTED = '.darling-anchor, .ph-mark, .ghost, .fn';
+const UNCOUNTED = '.darling-anchor, .ph-mark, .ghost, .fn, .math';
 function cleanChapterEl(id) {
   const el = document.querySelector(`.chapter[data-id="${id}"] .chapter-body`);
   let holder;
@@ -2905,12 +2905,19 @@ function wireChapterBody(body, chId) {
     writeOverGhost(); // pasted words over a gray note are prose, like typed ones
     const html = data.getData('text/html');
     const text = data.getData('text/plain');
+    // into a line of code: the text as it was, line for line
+    if (isCode(caretBlock(body))) {
+      const holder = document.createElement('div');
+      if (!text && html) holder.innerHTML = html;
+      pasteIntoCode(body, chId, text || holder.innerText || '');
+      return;
+    }
     // hyphens set as dialogue dashes, the same as typing them
     const edges = caretEdges(body);
     if (html) {
       document.execCommand('insertHTML', false, cleanPasteHtml(html, { style: dashStyle(), ...edges }));
       // the engine wraps inserted HTML (and its neighbours) in style spans
-      if (body.querySelector('span:not(.ph-mark):not(.fn)')) {
+      if (body.querySelector('span:not(.ph-mark):not(.fn):not(.math)')) {
         const caret = captureCaret();
         stripJunkSpans(body);
         restoreCaret(caret);
@@ -2993,6 +3000,9 @@ function wireChapterBody(body, chId) {
       smartKeys(e, body);
       return;
     }
+    if (handleCode(e, body, chId)) return;
+    if (codeFenceEnter(e, body, chId)) return;
+    if (mathBackspace(e, body, chId)) return;
     if (handlePoetry(e, body, chId)) return;
     if (handleFlush(e, body, chId)) return;
     if (poetryBackspace(e, body, chId)) return;
@@ -3017,6 +3027,9 @@ function wireChapterBody(body, chId) {
     if (mark) focusSticky(mark.dataset.sid);
     const fn = e.target.closest('.fn');
     if (fn) openFootnote(fn);
+    // a click on a formula opens it to edit, the closing $ sets it again
+    const math = e.target.closest('.math');
+    if (math && body.contains(math)) openMathAtEnd(math, body, chId);
     // clicking a ghost outline note selects it, ready to be replaced with prose
     const ghost = e.target.closest('p.ghost');
     if (ghost) {
@@ -3034,6 +3047,7 @@ function wireChapterBody(body, chId) {
     if (e.inputType !== 'insertLineBreak' || e.defaultPrevented) return;
     if (isScript()) { e.preventDefault(); return; } // a script's lines are its elements
     const key = { key: 'Enter', shiftKey: true, metaKey: false, ctrlKey: false, altKey: false, preventDefault: () => e.preventDefault() };
+    if (handleCode(key, body, chId)) return; // in code: the next line of it
     if (!handlePoetry(key, body, chId)) handleFlush(key, body, chId);
   });
   // the moment writing hits a ghost, it becomes prose
@@ -3671,7 +3685,7 @@ function guardMarkerDelete(e, body, chId) {
 // ("<span style='text-indent...'>"). They corrupt later edits — unwrap them,
 // keeping only NEO's own marks.
 function stripJunkSpans(el) {
-  for (const s of [...el.querySelectorAll('span:not(.ph-mark):not(.fn)')]) {
+  for (const s of [...el.querySelectorAll('span:not(.ph-mark):not(.fn):not(.math)')]) {
     while (s.firstChild) s.before(s.firstChild);
     s.remove();
   }
@@ -3742,7 +3756,7 @@ function handleEnter(e, body, chId) {
   if (!isStory(chId) && !block.classList.contains('poetry')) {
     e.preventDefault();
     enterRun = 0;
-    if (block.querySelector('span:not(.ph-mark):not(.fn)')) {
+    if (block.querySelector('span:not(.ph-mark):not(.fn):not(.math)')) {
       const caret = captureCaret();
       stripJunkSpans(block);
       restoreCaret(caret);
@@ -3835,7 +3849,7 @@ function handleEnter(e, body, chId) {
     // make the engine clone whole paragraphs) are stripped first if present
     e.preventDefault();
     caretOffFootnote(sel);
-    if (block.querySelector('span:not(.ph-mark):not(.fn)')) {
+    if (block.querySelector('span:not(.ph-mark):not(.fn):not(.math)')) {
       // Unwrapping moves text nodes, so preserve the caret's text position.
       const caret = captureCaret();
       stripJunkSpans(block);
@@ -3878,6 +3892,367 @@ function handleEnter(e, body, chId) {
     return true;
   }
   return false;
+}
+
+/* ================================================================== */
+/*  CODE BLOCKS — ⌘⇧B (Ctrl+Shift+B), or ``` then Enter               */
+/*  Lines of code between the prose, set monospaced with every space   */
+/*  kept: no curly quotes, dashes, capitals or Markdown in them. Each  */
+/*  line is a p.code, and a run of them reads as one block. Enter is   */
+/*  the next line; Enter on an empty last line, Esc or ⌘⇧B goes back   */
+/*  to prose; Backspace at the block's start makes that line prose.    */
+/*  INLINE MATHS — ⌘⇧M (Ctrl+Shift+M), or $…$                         */
+/*  LaTeX kept exactly as typed, in a span.math the caret steps over   */
+/*  whole (like a footnote's number). The closing $ sets it; Backspace */
+/*  just after it, a click on it or ⌘⇧M opens it again as $… to edit.  */
+/* ================================================================== */
+
+const KCODE = K('⌘⇧B', 'Ctrl+Shift+B');
+const KMATH = K('⌘⇧M', 'Ctrl+Shift+M');
+// a fence typed alone on a line: ``` (or ```js; the language is dropped)
+const CODE_FENCE = /^\s*```[\w+#.-]*\s*$/;
+const isCode = (p) => !!(p && p.classList && p.classList.contains('code'));
+// the caret's paragraph is a line of code, or the caret sits in a maths span
+function caretInCode(node) {
+  const el = node && (node.nodeType === Node.TEXT_NODE ? node.parentElement : node);
+  return !!(el && el.closest && el.closest('p.code, .math'));
+}
+
+// a paragraph made a line of code: no poetry italic, flush, alignment
+function makeCodeLine(p) {
+  if (p.classList.contains('poetry')) romanize(p);
+  p.classList.remove('poetry', 'flush');
+  p.removeAttribute('style');
+  p.classList.add('code');
+  if (p.textContent === '' && !p.querySelector('br')) p.innerHTML = '<br>';
+}
+// the last line of the code block p is in
+function codeBlockEnd(p) {
+  while (isCode(p.nextElementSibling)) p = p.nextElementSibling;
+  return p;
+}
+// back to prose below the block: the empty paragraph after it, or a new one
+function exitCodeBelow(block, body, chId) {
+  snapshotStructure('leave code block');
+  const end = codeBlockEnd(block);
+  let next = end.nextElementSibling;
+  if (!(next && next.tagName === 'P' && !isCode(next) && !next.classList.contains('scene-break') && next.textContent.trim() === '')) {
+    next = document.createElement('p');
+    next.innerHTML = '<br>';
+    end.after(next);
+  }
+  placeCaret(next, 0);
+  syncChapter(body, chId);
+  resetNativeUndo();
+  breakRun++;
+}
+function codeLineToProse(block, body, chId) {
+  snapshotStructure('code line to prose');
+  block.classList.remove('code');
+  if (!block.className) block.removeAttribute('class');
+  placeCaret(block, 0);
+  syncChapter(body, chId);
+  resetNativeUndo();
+  breakRun++;
+}
+
+// The keys inside a line of code. Enter (and ⇧Enter) is the next line, so
+// the double and triple Enter never make a *** or a chapter here.
+function handleCode(e, body, chId) {
+  if (e.metaKey || e.ctrlKey || e.altKey) return false;
+  const sel = window.getSelection();
+  if (!sel.rangeCount) return false;
+  const block = caretBlock(body);
+  if (!isCode(block)) return false;
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    enterRun = 0;
+    if (!sel.isCollapsed) document.execCommand('delete');
+    // Enter on an empty last line: that line is prose again
+    if (block.textContent === '' && !isCode(block.nextElementSibling)) {
+      codeLineToProse(block, body, chId);
+      return true;
+    }
+    document.execCommand('insertParagraph');
+    const cur = caretBlock(body);
+    if (cur && !isCode(cur)) cur.classList.add('code');
+    syncChapter(body, chId);
+    return true;
+  }
+  if (e.key === 'Escape' && !vimEnabled) {
+    // this Esc is the code block's: it must not go on to the page-wide
+    // Esc, which leaves the book for the shelf
+    e.preventDefault();
+    e.stopPropagation();
+    exitCodeBelow(block, body, chId);
+    return true;
+  }
+  // Tab indents with two plain spaces (prose's Tab sets em spaces);
+  // ⇧Tab takes back up to two before the caret
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    if (!e.shiftKey) { document.execCommand('insertText', false, '  '); return true; }
+    const r = sel.getRangeAt(0);
+    const node = r.startContainer;
+    if (sel.isCollapsed && node.nodeType === Node.TEXT_NODE) {
+      let n = 0;
+      while (n < 2 && r.startOffset - n > 0 && node.data[r.startOffset - n - 1] === ' ') n++;
+      if (n) {
+        const del = document.createRange();
+        del.setStart(node, r.startOffset - n);
+        del.setEnd(node, r.startOffset);
+        sel.removeAllRanges();
+        sel.addRange(del);
+        document.execCommand('delete');
+      }
+    }
+    return true;
+  }
+  // Backspace at the start of the block's first line: that line is prose
+  if (e.key === 'Backspace' && sel.isCollapsed && !isCode(block.previousElementSibling)) {
+    const r = sel.getRangeAt(0);
+    const head = document.createRange();
+    head.selectNodeContents(block);
+    try { head.setEnd(r.startContainer, r.startOffset); } catch { return false; }
+    if (head.toString().length !== 0) return false;
+    e.preventDefault();
+    codeLineToProse(block, body, chId);
+    return true;
+  }
+  return false;
+}
+
+// ``` alone on a line, then Enter: that line opens a code block
+function codeFenceEnter(e, body, chId) {
+  if (e.key !== 'Enter' || e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return false;
+  if (markdownOff()) return false;
+  const block = caretBlock(body);
+  if (!block || isCode(block) || block.classList.contains('scene-break') || !CODE_FENCE.test(block.textContent)) return false;
+  e.preventDefault();
+  enterRun = 0;
+  snapshotStructure('code block');
+  block.innerHTML = '<br>';
+  makeCodeLine(block);
+  placeCaret(block, 0);
+  syncChapter(body, chId);
+  resetNativeUndo();
+  breakRun++;
+  return true;
+}
+
+// ⌘⇧B (Ctrl+Shift+B). In prose, the way ⌘⇧Enter makes poetry: at a
+// paragraph's end a code line opens beneath it, mid-paragraph the text after
+// the caret becomes one, and an empty paragraph (or the caret at its start)
+// turns into one. Over a selection, every paragraph it touches turns to code
+// or, when all of them are code already, back to prose. In code: back to prose.
+function toggleCode() {
+  const sel = window.getSelection();
+  if (!sel.rangeCount) return;
+  let el = sel.anchorNode;
+  if (el && el.nodeType === Node.TEXT_NODE) el = el.parentElement;
+  const body = el && el.closest ? el.closest('.chapter-body') : null;
+  if (!body || isScript()) { toast(t('Click into a chapter first, then {key} starts a code block', { key: KCODE })); return; }
+  const chId = body.closest('.chapter').dataset.id;
+  currentChapterId = chId;
+  const r = sel.getRangeAt(0);
+  if (!sel.isCollapsed) {
+    const ps = [...body.querySelectorAll(':scope > p')].filter((p) => r.intersectsNode(p) && !p.classList.contains('scene-break') && !p.classList.contains('ghost'));
+    if (!ps.length) return;
+    snapshotStructure('code block');
+    const on = !ps.every(isCode);
+    for (const p of ps) {
+      if (on) makeCodeLine(p);
+      else { p.classList.remove('code'); if (!p.className) p.removeAttribute('class'); }
+    }
+    placeCaret(ps[0], 0);
+    syncChapter(body, chId);
+    resetNativeUndo();
+    breakRun++;
+    return;
+  }
+  const block = caretBlock(body);
+  if (!block || block.classList.contains('scene-break') || block.classList.contains('ghost')) return;
+  if (isCode(block)) { exitCodeBelow(block, body, chId); return; }
+  snapshotStructure('code block');
+  const tail = document.createRange();
+  tail.selectNodeContents(block);
+  try { tail.setStart(r.startContainer, r.startOffset); } catch { return; }
+  const after = tail.toString();
+  if (block.textContent.trim() === '' || after.length === block.textContent.length) {
+    makeCodeLine(block);
+    placeCaret(block, 0);
+  } else {
+    const line = document.createElement('p');
+    if (after !== '') {
+      line.appendChild(tail.extractContents());
+      for (const junk of line.querySelectorAll('br')) junk.remove();
+      if (!block.textContent.trim()) block.innerHTML = '<br>';
+    }
+    makeCodeLine(line);
+    block.after(line);
+    placeCaret(line, 0);
+  }
+  syncChapter(body, chId);
+  resetNativeUndo();
+  breakRun++;
+}
+
+// Pasted into a line of code, text goes in as it was: one line of code per
+// line, blank lines and leading spaces kept, nothing made typographic.
+function pasteIntoCode(body, chId, text) {
+  const lines = text.replace(/\r\n?/g, '\n').replace(/\t/g, '  ').split('\n');
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  lines.forEach((line, i) => {
+    if (i > 0) {
+      document.execCommand('insertParagraph');
+      const cur = caretBlock(body);
+      if (cur && !isCode(cur)) cur.classList.add('code');
+    }
+    if (line) document.execCommand('insertText', false, line);
+  });
+  syncChapter(body, chId);
+}
+
+function mathSpan(tex) {
+  const span = document.createElement('span');
+  span.className = 'math';
+  span.contentEditable = 'false';
+  span.textContent = tex;
+  return span;
+}
+// the caret on the far side of an atom (a maths span, a footnote's number):
+// in the text that follows it, made if there's none, so typing goes there
+function caretPast(atom) {
+  let next = atom.nextSibling;
+  if (!next || next.nodeType !== Node.TEXT_NODE) {
+    next = document.createTextNode('');
+    atom.after(next);
+  }
+  placeCaret(next, 0);
+}
+// the maths span just behind a collapsed caret, if any
+function mathBeforeCaret(sel) {
+  if (!sel.rangeCount || !sel.isCollapsed) return null;
+  const r = sel.getRangeAt(0);
+  const node = r.startContainer;
+  let prev;
+  if (node.nodeType === Node.TEXT_NODE) {
+    if (r.startOffset > 0) return null;
+    prev = node.previousSibling;
+    // past an empty text node or two
+    while (prev && prev.nodeType === Node.TEXT_NODE && prev.data === '') prev = prev.previousSibling;
+  } else {
+    prev = node.childNodes[r.startOffset - 1];
+  }
+  return prev && prev.nodeType === Node.ELEMENT_NODE && prev.classList.contains('math') ? prev : null;
+}
+// A maths span opened for editing: it goes back to its text, $ in front,
+// so the closing $ sets it again (the caller puts the caret).
+let mathOpen = null; // the paragraph holding a $ opened this way, for the closing $
+function openMath(span, body, chId) {
+  snapshotStructure('edit maths');
+  const p = span.closest('p');
+  span.replaceWith(document.createTextNode('$' + span.textContent));
+  p.normalize();
+  mathOpen = p;
+  syncChapter(body, chId);
+  resetNativeUndo();
+  breakRun++;
+}
+
+// The $ that closes $…$: the LaTeX between the marks becomes a maths span.
+// Only where the marks hug the formula ($x$, $a + b$), so prices like $5 or
+// $10 stay as typed: the closing $ needs no space before it, and the opening
+// one no space after it and no letter or digit before it.
+const MATH_CLOSE = /(^|[^\\$\p{L}\p{N}])\$(?![\s$])([^$]*?[^\s\\$])$/u;
+function markdownMath(e, body, range) {
+  if (e.key !== '$' || !range.collapsed) return false;
+  if (!body.matches || !body.matches('.chapter-body')) return false;
+  const start = range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.parentElement : range.startContainer;
+  const block = start && start.closest('p');
+  if (!block || !body.contains(block) || isCode(block) || block.closest('.math')) return false;
+  if (markdownOff() && mathOpen !== block) return false;
+  const pre = document.createRange();
+  pre.setStart(block, 0);
+  pre.setEnd(range.startContainer, range.startOffset);
+  const before = pre.toString();
+  const m = before.match(MATH_CLOSE);
+  if (!m) return false;
+  e.preventDefault();
+  mathOpen = null;
+  const chId = body.closest('.chapter').dataset.id;
+  snapshotStructure('maths');
+  const at = before.length - m[0].length + m[1].length; // where the opening $ sits
+  selectChars(block, at, before.length);
+  const sel = window.getSelection();
+  const r = sel.getRangeAt(0);
+  r.deleteContents();
+  const span = mathSpan(m[2]);
+  r.insertNode(span);
+  syncChapter(body, chId);
+  resetNativeUndo();
+  // after the reset: put back by character count, the caret would land
+  // inside the formula, where nothing can be typed
+  caretPast(span);
+  breakRun++;
+  return true;
+}
+
+// ⌘⇧M (Ctrl+Shift+M): the selected words become maths; just past a maths
+// span, it opens for editing; otherwise a $ goes in, and the closing $ that
+// follows sets the formula (even with Markdown typing turned off).
+function insertMath() {
+  const sel = window.getSelection();
+  if (!sel.rangeCount) return;
+  let el = sel.anchorNode;
+  if (el && el.nodeType === Node.TEXT_NODE) el = el.parentElement;
+  const body = el && el.closest ? el.closest('.chapter-body') : null;
+  const p = body && el.closest('.chapter-body > p');
+  if (!body || !p || isScript() || isCode(p) || p.classList.contains('scene-break') || p.classList.contains('ghost')) {
+    toast(t('Click into a chapter first, then {key} adds maths', { key: KMATH }));
+    return;
+  }
+  const chId = body.closest('.chapter').dataset.id;
+  currentChapterId = chId;
+  const r = sel.getRangeAt(0);
+  if (!sel.isCollapsed) {
+    const tex = r.toString().replace(/\s+/g, ' ').trim();
+    if (!tex || !p.contains(r.endContainer)) return;
+    snapshotStructure('maths');
+    r.deleteContents();
+    const span = mathSpan(tex);
+    r.insertNode(span);
+    syncChapter(body, chId);
+    resetNativeUndo();
+    // after the reset: put back by character count, the caret would land
+    // inside the formula, where nothing can be typed
+    caretPast(span);
+    breakRun++;
+    return;
+  }
+  const behind = mathBeforeCaret(sel);
+  if (behind) { openMathAtEnd(behind, body, chId); return; }
+  document.execCommand('insertText', false, '$');
+  mathOpen = p;
+}
+// open a maths span for editing, the caret just after its last character
+function openMathAtEnd(span, body, chId) {
+  const p = span.closest('p');
+  const pre = document.createRange();
+  pre.setStart(p, 0);
+  pre.setEndBefore(span);
+  const at = pre.toString().length + 1 + span.textContent.length; // past the $ and the formula
+  openMath(span, body, chId);
+  selectChars(p, at, at);
+}
+// Backspace just past a maths span opens it, rather than deleting the formula
+function mathBackspace(e, body, chId) {
+  if (e.key !== 'Backspace' || e.metaKey || e.ctrlKey || e.altKey) return false;
+  const span = mathBeforeCaret(window.getSelection());
+  if (!span || !body.contains(span)) return false;
+  e.preventDefault();
+  openMathAtEnd(span, body, chId);
+  return true;
 }
 
 /* ================================================================== */
@@ -3951,7 +4326,7 @@ function handlePoetry(e, body, chId) {
 
   if (block.classList.contains('poetry')) {
     // the engine's own split keeps the class on the new line, and ⌘Z sees it
-    if (block.querySelector('span:not(.ph-mark):not(.fn)')) stripJunkSpans(block);
+    if (block.querySelector('span:not(.ph-mark):not(.fn):not(.math)')) stripJunkSpans(block);
     document.execCommand('insertParagraph');
     const cur = caretBlock(body);
     if (cur) {
@@ -4006,7 +4381,7 @@ function handleFlush(e, body, chId) {
   if (!block) return false;
   e.preventDefault();
   if (block.classList.contains('scene-break')) return true;
-  if (block.querySelector('span:not(.ph-mark):not(.fn)')) stripJunkSpans(block);
+  if (block.querySelector('span:not(.ph-mark):not(.fn):not(.math)')) stripJunkSpans(block);
   if (block.classList.contains('flush')) {
     // the engine's own split keeps the class on the new line, and ⌘Z sees it
     document.execCommand('insertParagraph');
@@ -4176,7 +4551,7 @@ function dropJunkSpans(html) {
   const junk = [];
   return html.replace(/<span\b[^>]*>|<\/span>/g, (tag) => {
     if (tag[1] === '/') return junk.pop() ? '' : tag;
-    const drop = !/\sclass="[^"]*\b(?:ph-mark|fn)\b/.test(tag);
+    const drop = !/\sclass="[^"]*\b(?:ph-mark|fn|math)\b/.test(tag);
     junk.push(drop);
     return drop ? '' : tag;
   });
@@ -4193,7 +4568,7 @@ const OPENING_DASH = /^\s*[-‐‑‒–—―]/;
 // chapter it's the paragraph waiting for the first word. Marked data-first,
 // for the screen only.
 function openingPara(body) {
-  const ps = [...body.children].filter((p) => p.tagName === 'P' && !p.classList.contains('poetry') && !p.classList.contains('scene-break') && !p.classList.contains('ghost'));
+  const ps = [...body.children].filter((p) => p.tagName === 'P' && !p.classList.contains('poetry') && !p.classList.contains('code') && !p.classList.contains('scene-break') && !p.classList.contains('ghost'));
   return ps.find((p) => p.textContent.trim() !== '') || ps[0] || null;
 }
 function markDialogueOpening(body) {
@@ -4642,6 +5017,9 @@ function smartKeys(e, body) {
   // a field can reach smartKeys twice (its own handler and the page-wide
   // one below): the first pass wins
   if (e.defaultPrevented) return;
+  // code and maths are typed exactly: no dashes, capitals, quotes or Markdown
+  const here = window.getSelection();
+  if (here && here.rangeCount && caretInCode(here.getRangeAt(0).startContainer)) return;
   dialogueDashKey(e, body);
   autoCapKey(e, body);
   if (e.defaultPrevented) return;
@@ -4659,6 +5037,7 @@ function smartKeys(e, body) {
     return node.textContent.slice(Math.max(0, range.startOffset - n), range.startOffset);
   };
 
+  if (markdownMath(e, body, range)) return;
   if (markdownEmphasis(e, body, range)) return;
   // German sets its dash as an en dash – like this –, so there -- makes
   // one, and a third hyphen the em dash (#286)
@@ -5003,6 +5382,15 @@ document.addEventListener('keydown', (e) => {
   if (cmd && e.shiftKey && e.code === 'KeyD') {
     e.preventDefault();
     if (currentTab === 'manuscript') darlingFromKeyboard();
+  }
+  // ⌘⇧B a code block, ⌘⇧M inline maths (CODE BLOCKS)
+  if (cmd && e.shiftKey && !e.altKey && e.code === 'KeyB') {
+    e.preventDefault();
+    if (currentTab === 'manuscript' && moreOn()) toggleCode();
+  }
+  if (cmd && e.shiftKey && !e.altKey && e.code === 'KeyM') {
+    e.preventDefault();
+    if (currentTab === 'manuscript' && moreOn()) insertMath();
   }
   if (cmd && e.shiftKey && !e.altKey && e.code === 'KeyN') {
     e.preventDefault();
@@ -7129,7 +7517,7 @@ function caretOffFootnote(sel) {
   const node = r.startContainer;
   if (node.nodeType !== Node.ELEMENT_NODE) return;
   const before = node.childNodes[r.startOffset - 1];
-  if (!before || !before.classList || !before.classList.contains('fn')) return;
+  if (!before || !before.classList || !(before.classList.contains('fn') || before.classList.contains('math'))) return;
   let next = before.nextSibling;
   if (!next || next.nodeType !== Node.TEXT_NODE) {
     next = document.createTextNode('');
@@ -14111,7 +14499,7 @@ async function spellScanEl(el, key) {
   let n;
   while ((n = walker.nextNode())) {
     const p = n.parentElement;
-    if (p && p.closest('.scene-break, .ghost, .ph-mark')) continue;
+    if (p && p.closest('.scene-break, .ghost, .ph-mark, .code, .math')) continue;
     let m;
     re.lastIndex = 0;
     while ((m = re.exec(n.data))) {
@@ -15228,6 +15616,10 @@ function bookShortcutSections() {
       ...(more ? [[K('⌘⇧Enter', 'Ctrl+Shift+Enter'), tk('Start or continue a poetry paragraph'), tk('Also works from a chapter heading.')]] : []),
       [KPH, tk('Insert a placeholder note')],
       ...(more ? [[KFN, tk('Add a footnote'), tk('Type the note, then Enter to go back to writing. Click its number to change it.')]] : []),
+      ...(more ? [
+        [[KCODE, '```'], tk('Start or leave a code block'), tk('Type ``` alone on a line, then Enter, to start one. Each Enter is a new line of code; Enter on an empty last line, or Esc, goes back to prose.')],
+        [[KMATH, '$…$'], tk('Inline maths, written in LaTeX'), tk('Type $ around the formula, or select it and press the keys. Click it, or Backspace just after it, to edit it.')]
+      ] : []),
       [KDA, tk('Move selected text to Darlings')],
       ...(more ? [[K('⌘⇧U', IS_LINUX ? 'Ctrl+Shift+K' : 'Ctrl+Shift+U'), tk('Read aloud from the cursor'), tk('Again, Esc or any key stops it. Uses your computer’s own voice.')]] : [])
     ] },
@@ -15386,12 +15778,16 @@ function parasFromHtml(html) {
   holder.querySelectorAll('.darling-anchor, .ph-mark, .ghost').forEach((n) => n.remove());
   return [...holder.querySelectorAll('p')].map((p) => {
     const sceneBreak = p.classList.contains('scene-break');
-    const poetry = p.classList.contains('poetry');
-    const flush = !poetry && p.classList.contains('flush');
+    const code = !sceneBreak && p.classList.contains('code');
+    const poetry = !code && p.classList.contains('poetry');
+    const flush = !poetry && !code && p.classList.contains('flush');
     const align = (p.style && p.style.textAlign) || '';
     const runs = paraRuns(p.innerHTML, true).filter((r) => r.text || r.fn !== undefined);
     const inner = runs.map((r) => runHtml(r)).join('');
     p.querySelectorAll('.fn').forEach((f) => f.remove());
+    // a line of code keeps its leading spaces, and an empty one stays: it's
+    // a blank line inside the block
+    if (code) return { sceneBreak: false, poetry: false, flush: false, code: true, text: p.textContent, runs, align: '', html: `<p class="code">${inner}</p>` };
     return {
       sceneBreak,
       poetry,
@@ -15401,7 +15797,7 @@ function parasFromHtml(html) {
       align,
       html: `<p${poetry ? ' class="poetry"' : flush ? ' class="flush"' : ''}${align ? ` style="text-align:${align}"` : ''}>${inner}</p>`
     };
-  }).filter((p) => p.sceneBreak || p.text);
+  }).filter((p) => p.sceneBreak || p.code || p.text);
 }
 
 // The book's entries as the builders lay them out. Chapters, a prologue and
@@ -15500,7 +15896,8 @@ function manuscriptSections() {
   const { sections } = exportChapters();
   return sections.filter((s) => s.kind === 'chapter' || s.kind === 'part' || s.kind === 'epigraph').map((s) => ({
     kind: s.kind, heading: s.heading || '', partTitle: s.partTitle || '',
-    paras: s.paras.map((p) => ({ sceneBreak: p.sceneBreak, poetry: p.poetry, flush: p.flush, align: p.align, runs: p.runs || [] })),
+    paras: s.paras.map((p) => ({ sceneBreak: p.sceneBreak, poetry: p.poetry, flush: p.flush || p.code, align: p.align,
+      runs: p.code ? [{ text: p.text }] : (p.runs || []).map((r) => (r.m ? { ...r, text: '$' + r.text + '$', m: false } : r)) })),
     words: s.paras.reduce((n, p) => n + (p.sceneBreak ? 0 : countWords(p.text || '')), 0)
   }));
 }
@@ -15740,6 +16137,7 @@ function buildPrintHtml(d, o) {
       if (p.sceneBreak) { afterBreak = true; return '<p class="brk">*&#8195;*&#8195;*</p>'; }
       const inner = atFoot(p.html.replace(/^<p[^>]*>|<\/p>$/g, ''), p);
       if (p.poetry) { afterBreak = false; return `<p class="poetry"${p.align ? ` style="text-align:${p.align}"` : ''}>${inner}</p>`; }
+      if (p.code) return `<p class="code">${inner}</p>`;
       const cls = ['hy'];
       if (first) cls.push('first');
       if (first && OPENING_DASH.test(p.text)) cls.push('dialogue');
@@ -15751,6 +16149,7 @@ function buildPrintHtml(d, o) {
   };
   const lines = (paras) => paras.map((p) => {
     if (p.sceneBreak) return '<p class="brk">*&#8195;*&#8195;*</p>';
+    if (p.code) return p.html;
     const cls = [isAttribution(p) ? 'attr' : '', p.poetry ? 'poetry' : ''].filter(Boolean).join(' ');
     return `<p${cls ? ` class="${cls}"` : ''}>${atFoot(p.html.replace(/^<p[^>]*>|<\/p>$/g, ''), p)}</p>`;
   }).join('\n');
@@ -15912,6 +16311,10 @@ ${cap ? `p.first:not(.dialogue)::first-letter { initial-letter: 2; -webkit-initi
 p.brk { text-align: center; margin: 0.7em 0; break-after: avoid; letter-spacing: 0.1em; }
 p.poetry { margin: 0.5em 1.5em; text-align: left; }
 p.poetry + p.poetry { margin-top: 0; }
+p.code { font-family: "Courier Prime", "Courier New", monospace; font-size: 0.8em; line-height: 1.4; text-indent: 0; text-align: left; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; }
+p.code:not(p.code + p.code) { margin-top: 0.7em; }
+p.code:not(:has(+ p.code)) { margin-bottom: 0.7em; }
+.math { font-family: "Courier Prime", "Courier New", monospace; font-size: 0.86em; white-space: pre-wrap; }
 .backpage p.hy { text-indent: 0; margin-bottom: 0.7em; }
 .also p { text-align: center; font-style: italic; margin: 0 0 0.45em; }
 .note .reach-hd { margin-top: 1.4em; text-align: center; letter-spacing: 0.18em; text-transform: uppercase; font-size: 0.85em; }
@@ -16112,11 +16515,15 @@ function buildTxt(data) {
   for (const ch of d.sections) {
     if (ch.heading) out += `${plainHeading(ch).toUpperCase()}\n\n`;
     const notes = [];
-    for (const p of ch.paras) {
-      const noted = (p.runs || []).some((r) => r.fn !== undefined);
-      const text = noted ? p.runs.map((r) => (r.fn !== undefined ? (notes.push(r.fn), `[${++fnN}]`) : r.text)).join('').trim() : p.text;
+    ch.paras.forEach((p, i) => {
+      if (p.code) {
+        out += '    ' + p.text + '\n' + (ch.paras[i + 1] && ch.paras[i + 1].code ? '' : '\n');
+        return;
+      }
+      const noted = (p.runs || []).some((r) => r.fn !== undefined || r.m);
+      const text = noted ? p.runs.map((r) => (r.fn !== undefined ? (notes.push(r.fn), `[${++fnN}]`) : r.m ? `$${r.text}$` : r.text)).join('').trim() : p.text;
       out += p.sceneBreak ? '\n***\n\n' : (p.poetry ? '    ' : '') + text + '\n\n';
-    }
+    });
     if (notes.length) out += '----------\n' + notes.map((n, i) => `[${fnN - notes.length + i + 1}] ${n}`).join('\n') + '\n\n';
     out += '\n';
   }
@@ -16139,10 +16546,18 @@ function buildMd(data) {
   for (const ch of d.sections) {
     if (ch.heading) out += `\n## ${mdMeta(plainHeading(ch))}\n\n`;
     const notes = [];
-    for (const p of ch.paras) {
-      const runs = (p.runs || []).map((r) => (r.fn !== undefined ? (notes.push(r.fn), { text: '\uE001' + (++fnN) + '\uE002' }) : r));
-      out += p.sceneBreak ? '\n***\n\n' : (p.poetry ? '> ' : '') + mdRuns(runs).replace(/\uE001(\d+)\uE002/g, '[^$1]') + '\n\n';
-    }
+    ch.paras.forEach((p, i) => {
+      if (p.code) {
+        const prev = ch.paras[i - 1];
+        const next = ch.paras[i + 1];
+        out += (prev && prev.code ? '' : '```\n') + p.text + '\n' + (next && next.code ? '' : '```\n\n');
+        return;
+      }
+      const tex = [];
+      const runs = (p.runs || []).map((r) => (r.fn !== undefined ? (notes.push(r.fn), { text: '\uE001' + (++fnN) + '\uE002' })
+        : r.m ? (tex.push(r.text), { text: '\uE003' + (tex.length - 1) + '\uE004' }) : r));
+      out += p.sceneBreak ? '\n***\n\n' : (p.poetry ? '> ' : '') + mdRuns(runs).replace(/\uE001(\d+)\uE002/g, '[^$1]').replace(/\uE003(\d+)\uE004/g, (m, n) => '$' + tex[n] + '$') + '\n\n';
+    });
     notes.forEach((n, i) => { out += `[^${fnN - notes.length + i + 1}]: ${mdMeta(n)}\n`; });
     if (notes.length) out += '\n';
   }
@@ -16217,6 +16632,7 @@ function buildHtml(data, opts = {}) {
     return paras.map((p) => {
       if (p.sceneBreak) { afterBreak = initial; return '<p class="brk">***</p>'; }
       if (p.poetry) { afterBreak = false; return p.html; }
+      if (p.code) return p.html;
       let html = p.html;
       if (first || afterBreak) {
         const h = document.createElement('div');
@@ -16235,6 +16651,7 @@ function buildHtml(data, opts = {}) {
   // a page's lines, each set on its own
   const lines = (paras, attrs = true) => paras.map((p) => {
     if (p.sceneBreak) return '<p class="brk">***</p>';
+    if (p.code) return p.html;
     const cls = [attrs && isAttribution(p) ? 'attr' : '', p.poetry ? 'poetry' : ''].filter(Boolean).join(' ');
     return `<p${cls ? ` class="${cls}"` : ''}${p.align ? ` style="text-align:${p.align}"` : ''}>${p.html.replace(/^<p[^>]*>|<\/p>$/g, '')}</p>`;
   }).join('\n');
@@ -16337,6 +16754,10 @@ function buildHtml(data, opts = {}) {
   .chapter .brk, .brk { text-align: center; text-indent: 0 !important; letter-spacing: 8px; color: #888; margin: 2.5em 0; }
   .chapter p.poetry { text-indent: 0; margin: 0 2.5em; }
   .chapter p.flush { text-indent: 0 !important; }
+  p.code { font-family: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.82em; line-height: 1.5; text-indent: 0 !important; margin: 0; padding: 0 0.9em; white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; background: #f2f2f0; }
+  p.code:not(p.code + p.code) { margin-top: 0.9em; padding-top: 0.5em; }
+  p.code:not(:has(+ p.code)) { margin-bottom: 0.9em; padding-bottom: 0.5em; }
+  .math { font-family: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.88em; white-space: pre-wrap; }
   .chapter p:not(.poetry) + p.poetry, .chapter .hd + p.poetry { margin-top: 0.9em; }
   .chapter p.poetry + p:not(.poetry) { margin-top: 0.9em; }
   .chapter p.byline { text-align: center; margin: -24px 0 40px; letter-spacing: 3px; text-transform: uppercase; font-size: 10pt; color: #555; }
@@ -16432,6 +16853,7 @@ function fnParas(paras, start, mark) {
 function runHtml(r, esc = escHtml) {
   if (r.br) return '<br>';
   if (r.fn !== undefined) return `<span class="fn" data-note="${escAttr(r.fn)}" contenteditable="false">\u200B</span>`;
+  if (r.m) return `<span class="math" contenteditable="false">${esc(r.text)}</span>`;
   let t = esc(r.text);
   if (r.s) t = '<s>' + t + '</s>';
   if (r.u) t = '<u>' + t + '</u>';
@@ -16534,6 +16956,12 @@ function paraRuns(pHtml, flip) {
           runs.push({ fn: child.dataset.note || '', text: '' });
           continue;
         }
+        // inline maths: its LaTeX as one run, marked m (a builder that
+        // doesn't know maths still prints the formula as text)
+        if (child.classList && child.classList.contains('math')) {
+          if (child.textContent) runs.push({ text: child.textContent, m: true, b, i, u, s: x });
+          continue;
+        }
         const tag = child.tagName;
         // a line break inside a paragraph (a chapter file written elsewhere)
         // stays a break, not two words run together
@@ -16591,7 +17019,7 @@ function docxP(runs, opts = {}) {
     const size = r.size || opts.size;
     // italic and bold are character styles (Emphasis, Strong), so an editor
     // or typesetter can find and restyle them all at once
-    const rStyle = r.b && it ? 'StrongEmphasis' : r.b ? 'Strong' : it ? 'Emphasis' : '';
+    const rStyle = r.m ? 'Maths' : r.b && it ? 'StrongEmphasis' : r.b ? 'Strong' : it ? 'Emphasis' : '';
     // in the order the schema wants them (Word is strict about it)
     const rPr = (rStyle ? `<w:rStyle w:val="${rStyle}"/>` : '')
       + (caps === true ? '<w:caps/>' : caps === false ? '<w:caps w:val="0"/>' : '')
@@ -16675,6 +17103,7 @@ function docxEntriesOf(data) {
     // right-set line adds its alignment on top
     for (const p of ch.paras) {
       if (p.sceneBreak) body.push(docxP([{ text: '***' }], { style: 'SceneBreak' }));
+      else if (p.code) body.push(docxP(p.text ? [{ text: p.text }] : [], { style: 'Code' }));
       else if (p.poetry) body.push(docxP(paraRuns(p.html), { style: 'Poetry', align: p.align === 'center' || p.align === 'right' ? p.align : '' }));
       else if (p.align === 'center' || p.align === 'right') body.push(docxP(paraRuns(p.html), { style: 'BodyTextNoIndent', align: p.align }));
       else body.push(docxP(paraRuns(p.html), { style: p.flush ? 'BodyTextNoIndent' : 'BodyText' }));
@@ -16699,6 +17128,7 @@ function docxEntriesOf(data) {
 ${para('BodyText', 'Body Text', '<w:ind w:firstLine="480"/>')}
 ${para('BodyTextNoIndent', 'Body Text No Indent', '', 'BodyText')}
 ${para('Poetry', 'Poetry', '<w:ind w:left="720" w:right="720"/>')}
+${para('Code', 'Code', '<w:spacing w:after="0" w:line="240" w:lineRule="auto"/><w:ind w:left="360"/>', 'Code', '<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="20"/>')}
 ${para('SceneBreak', 'Scene Break', '<w:spacing w:before="240"/><w:jc w:val="center"/>', 'BodyText')}
 ${para('Title', 'Title', '<w:spacing w:before="3000"/><w:jc w:val="center"/>', 'Normal', '<w:b/><w:sz w:val="56"/>')}
 ${para('Subtitle', 'Subtitle', '<w:jc w:val="center"/>', 'Normal', '<w:i/><w:sz w:val="32"/>')}
@@ -16707,6 +17137,7 @@ ${[1, 2, 3].map(headingStyle).join('\n')}
 ${chr('Emphasis', 'Emphasis', '<w:i/>')}
 ${chr('Strong', 'Strong', '<w:b/>')}
 ${chr('StrongEmphasis', 'Strong Emphasis', '<w:b/><w:i/>')}
+${chr('Maths', 'Maths', '<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/>')}
 ${para('FootnoteText', 'footnote text', '<w:spacing w:after="0" w:line="240" w:lineRule="auto"/>', 'FootnoteText', '<w:sz w:val="20"/>')}
 ${chr('FootnoteReference', 'footnote reference', '<w:vertAlign w:val="superscript"/>')}
 </w:styles>`;
@@ -16768,6 +17199,7 @@ function chapterXhtml(ch, d) {
       fnN += 1;
       return `<sup class="fnref"><a epub:type="noteref" href="#fn${fnN}" id="fnr${fnN}">${fnN}</a></sup>`;
     }
+    if (r.m) return `<code class="math">${escXml(r.text)}</code>`;
     let t = escXml(r.text);
     if (r.s) t = '<s>' + t + '</s>';
     if (r.u) t = '<u>' + t + '</u>';
@@ -16778,6 +17210,7 @@ function chapterXhtml(ch, d) {
   // a page's lines, each set on its own
   const lines = () => ch.paras.map((p) => {
     if (p.sceneBreak) return '<p class="brk">* * *</p>';
+    if (p.code) return `<p class="code">${xhtmlRuns(p)}</p>`;
     const cls = [kind !== 'copyright' && isAttribution(p) ? 'attr' : '', p.poetry ? 'poetry' : '', p.align === 'center' || p.align === 'right' ? p.align : ''].filter(Boolean);
     return `<p${cls.length ? ` class="${cls.join(' ')}"` : ''}>${xhtmlRuns(p)}</p>`;
   }).join('\n');
@@ -16798,6 +17231,7 @@ ${ch.subtitle ? `<p class="sub">${escXml(ch.subtitle)}</p>` : ''}${ch.byline ? `
     let first = true;
     const paras = ch.paras.map((p) => {
       if (p.sceneBreak) { first = true; return '<p class="brk">* * *</p>'; }
+      if (p.code) return `<p class="code">${xhtmlRuns(p)}</p>`;
       const classes = [];
       if (p.poetry) classes.push('poetry');
       else if (p.flush) classes.push('flush');
@@ -16939,6 +17373,8 @@ p.right { text-align: right; text-indent: 0; }
 p.brk { text-align: center; text-indent: 0; margin: 2.5em 0; letter-spacing: 0.5em; }
 p.poetry { text-indent: 0; margin: 0 2em; }
 p.flush { text-indent: 0 !important; }
+p.code { font-family: monospace; font-size: 0.85em; text-indent: 0 !important; text-align: left; margin: 0; white-space: pre-wrap; -webkit-hyphens: none; -epub-hyphens: none; hyphens: none; }
+code.math { font-family: monospace; font-size: 0.9em; }
 p:not(.poetry) + p.poetry, h1 + p.poetry { margin-top: 0.9em; }
 p.poetry + p:not(.poetry) { margin-top: 0.9em; }
 p.byline { text-align: center; text-indent: 0; letter-spacing: 0.2em; text-transform: uppercase; font-size: 0.8em; margin: -1em 0 2em; }
