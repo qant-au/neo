@@ -102,6 +102,29 @@
     return `<w:p>${pPr.length ? '<w:pPr>' + pPr.join('') + '</w:pPr>' : ''}${runsXml(runs)}</w:p>`;
   }
   const plainRun = (text) => [{ text }];
+  // A paragraph with maths in it (a run with omml, the formula as a Word
+  // equation): each formula centred on a line of its own, as on the page,
+  // the words after it carrying on below without an indent
+  function withMaths(runs, o) {
+    if (!(runs || []).some((r) => r.omml)) return [p(runs, o)];
+    const out = [];
+    let words = [];
+    let opts = o;
+    const flush = () => {
+      // the words after an equation start their line: no space in front
+      if (out.length && words[0] && words[0].text) words[0] = { ...words[0], text: words[0].text.replace(/^\s+/, '') };
+      if (words.some((r) => (r.text && r.text.trim()) || r.fn !== undefined)) { out.push(p(words, opts)); opts = { ...opts, pageBreak: false }; }
+      words = [];
+    };
+    for (const r of runs) {
+      if (!r.omml) { words.push(r); continue; }
+      flush();
+      out.push(`<w:p><w:pPr><w:pStyle w:val="ManuscriptNoIndent"/>${opts.pageBreak ? '<w:pageBreakBefore/>' : ''}<w:jc w:val="center"/></w:pPr><m:oMathPara>${r.omml}</m:oMathPara></w:p>`);
+      opts = { ...o, pageBreak: false, style: o.style === 'Manuscript' ? 'ManuscriptNoIndent' : o.style };
+    }
+    flush();
+    return out;
+  }
 
   // The page a section is set on: one-inch margins, the header half an
   // inch from the top
@@ -159,9 +182,10 @@
           const pageBreak = lead;
           lead = false;
           if (x.sceneBreak) out.push(p(plainRun('#'), { style: 'SceneBreak', pageBreak }));
+          else if (x.code) out.push(p(x.text ? plainRun(x.text) : [], { style: 'Code', pageBreak }));
           else if (x.poetry) out.push(p(x.runs, { style: 'Poetry', pageBreak, align: x.align === 'center' || x.align === 'right' ? x.align : '' }));
           else if (x.align === 'center' || x.align === 'right') out.push(p(x.runs, { style: 'Centered', pageBreak, align: x.align === 'right' ? 'right' : '' }));
-          else out.push(p(x.runs, { style: x.flush ? 'ManuscriptNoIndent' : 'Manuscript', pageBreak }));
+          else out.push(...withMaths(x.runs, { style: x.flush ? 'ManuscriptNoIndent' : 'Manuscript', pageBreak }));
         }
         if (lead) out.push(p([], { pageBreak: true }));
       }
@@ -195,6 +219,7 @@
 <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style>
 ${para('Manuscript', 'Manuscript Text', `<w:ind w:firstLine="${TWIP / 2}"/>`)}
 ${para('ManuscriptNoIndent', 'Manuscript Text No Indent', '')}
+${para('Code', 'Code', '', '<w:rFonts w:ascii="Courier New" w:hAnsi="Courier New" w:cs="Courier New"/>')}
 ${para('Poetry', 'Poetry', `<w:ind w:left="${TWIP / 2}" w:right="${TWIP / 2}"/>`)}
 ${para('Centered', 'Centered', '<w:jc w:val="center"/>')}
 ${para('SceneBreak', 'Scene Break', '<w:jc w:val="center"/>')}
@@ -232,7 +257,7 @@ ${chr('FootnoteReference', 'footnote reference', '<w:vertAlign w:val="superscrip
     try { return docxParts(m); } finally { notes = null; }
   }
   function docxParts(m) {
-    const NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
+    const NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"';
     let body;
     if (m.short) {
       const story = storyBlocks(m);
@@ -288,6 +313,8 @@ ${headers.map((h) => `<Relationship Id="${h.id}" Type="http://schemas.openxmlfor
       if (r.br) return '<br>';
       // a footnote: Paged.js sets it at the foot of its page
       if (r.fn !== undefined) { fnCount += 1; return `<sup class="fncall">${fnCount}</sup><span class="footnote">${fnCount}. ${escHtml(r.fn)}</span>`; }
+      // a formula, set (MathML), centred on a line of its own
+      if (r.mathml) return r.mathml;
       let t = escHtml(r.text);
       if (r.s) t = '<s>' + t + '</s>';
       if (r.u) t = '<u>' + t + '</u>';
@@ -318,6 +345,7 @@ ${headers.map((h) => `<Relationship Id="${h.id}" Type="http://schemas.openxmlfor
       } else {
         const paras = (sec.paras || []).map((x) => {
           if (x.sceneBreak) return '<p class="brk">#</p>';
+          if (x.code) return `<p class="code">${escHtml(x.text || '') || '<br>'}</p>`;
           const c = x.poetry ? 'poetry' : x.align === 'center' ? 'c' : x.align === 'right' ? 'r' : x.flush ? 'flush' : '';
           return `<p${c ? ` class="${c}"` : ''}>${runsHtml(x.runs)}</p>`;
         }).join('\n');
@@ -347,6 +375,8 @@ p.flush, p.c, p.r, p.brk, p.end, p.poetry { text-indent: 0; }
 p.c, p.brk, p.end { text-align: center; }
 p.r { text-align: right; }
 p.poetry { margin: 0 0.5in; }
+p.code { text-indent: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: "Courier Prime", "Courier New", Cousine, "Liberation Mono", Courier, monospace; }
+math { display: block math; text-align: center; text-indent: 0; font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; }
 p.end { margin-top: 2em; }
 section.newpage { break-before: page; }
 h2 { font: inherit; font-weight: normal; text-align: center; margin: calc(${pp.in[1] / 3 - 1}in) 0 2em; break-after: avoid; }

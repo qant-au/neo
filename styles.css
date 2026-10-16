@@ -859,23 +859,23 @@ body.paged #paper:not(.script) #tp-author { font-size: calc(14px * var(--page-zo
 .chapter-body p:not(.poetry) + p.poetry { margin-top: 0.9em; }
 .chapter-body p.poetry + p:not(.poetry) { margin-top: 0.9em; }
 /* Code blocks (⌘⇧B, or ``` then Enter): one p.code per line, monospaced,
-   every space kept; consecutive lines make one shaded block. No colours:
-   the shade is the page's own ink, faint, so it suits every page theme. */
+   every space kept, set within the text's own margins, no shading: a book
+   page, not a code editor. A run of lines breathes above and below. */
 .chapter-body p.code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   font-size: 0.82em; line-height: 1.55; text-indent: 0 !important; margin: 0;
-  padding: 0 0.9em; white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; tab-size: 2;
-  background: color-mix(in srgb, currentColor 7%, transparent);
+  white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; tab-size: 2;
 }
-.chapter-body p.code:not(p.code + p.code) { margin-top: 0.9em; padding-top: 0.6em; border-top-left-radius: 4px; border-top-right-radius: 4px; }
-.chapter-body p.code:not(:has(+ p.code)) { margin-bottom: 0.9em; padding-bottom: 0.6em; border-bottom-left-radius: 4px; border-bottom-right-radius: 4px; }
-/* Inline maths (⌘⇧M, or $…$): the LaTeX as typed, monospaced, faintly
-   shaded; the caret steps over it whole, a click opens it to edit */
+.chapter-body p.code:not(p.code + p.code) { margin-top: 0.9em; }
+.chapter-body p.code:not(:has(+ p.code)) { margin-bottom: 0.9em; }
+/* Maths (⌘⇧M, or $…$): the formula typeset (app.js sets it from the span's
+   text), centred on a line of its own, the sentence carrying on below it;
+   the caret steps over it whole, a click opens it to edit */
 .chapter-body .math {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-  font-size: 0.86em; padding: 0 0.25em; border-radius: 3px; cursor: text;
-  white-space: pre; /* a formula moves to the next line whole, never split mid-way */
-  background: color-mix(in srgb, currentColor 8%, transparent);
+  /* a full-width inline block, not a block: to the editor it stays one
+     piece of the sentence, so the caret and typing keep their places */
+  display: inline-block; width: 100%; text-align: center; text-indent: 0;
+  margin: 0.45em 0; vertical-align: middle; cursor: text;
 }
 /* cap-off while the caret is in the first paragraph: the rule must stop
    MATCHING entirely — a matching first-letter rule, even styled to nothing,

@@ -4120,6 +4120,43 @@ function mathSpan(tex) {
   span.textContent = tex;
   return span;
 }
+// A formula set as maths: AsciiMath as typed (sum_(k=1)^n k), or LaTeX
+// when it has a backslash in it (\frac{a}{b}), made MathML, which the
+// engine draws itself. null when it can't be read: it shows as typed.
+let asciiMath = null;
+function mathMarkup(src, xml = false) {
+  try {
+    const tex = src.includes('\\') ? src : (asciiMath || (asciiMath = new AsciiMathParser())).parse(src);
+    const out = temml.renderToString(tex, { displayMode: true, xml });
+    return out.includes('temml-error') ? null : out;
+  } catch {
+    return null;
+  }
+}
+// On the page the span keeps the formula as its text (what's saved, counted
+// and exported), and shows it set, on a line of its own, from a shadow root.
+// Every span that lands on the page is set, however it got there: typed,
+// opened from a file, put back by ⌘Z.
+const MATH_SHEET = new CSSStyleSheet();
+MATH_SHEET.replaceSync(`math { font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; font-size: 1.1em; text-indent: 0; }
+.raw { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.82em; white-space: pre-wrap; }`);
+function typesetMath(span) {
+  const root = span.shadowRoot || span.attachShadow({ mode: 'open' });
+  const tex = span.textContent;
+  if (root.tex === tex) return;
+  root.tex = tex;
+  root.adoptedStyleSheets = [MATH_SHEET];
+  root.innerHTML = mathMarkup(tex) || `<span class="raw">${escHtml(tex)}</span>`;
+}
+new MutationObserver((list) => {
+  for (const m of list) {
+    for (const n of m.addedNodes) {
+      if (n.nodeType !== Node.ELEMENT_NODE) continue;
+      if (n.classList.contains('math')) typesetMath(n);
+      else if (n.firstElementChild) for (const s of n.getElementsByClassName('math')) typesetMath(s);
+    }
+  }
+}).observe(document.documentElement, { childList: true, subtree: true });
 // the caret on the far side of an atom (a maths span, a footnote's number):
 // in the text that follows it, made if there's none, so typing goes there
 function caretPast(atom) {
@@ -15618,7 +15655,7 @@ function bookShortcutSections() {
       ...(more ? [[KFN, tk('Add a footnote'), tk('Type the note, then Enter to go back to writing. Click its number to change it.')]] : []),
       ...(more ? [
         [[KCODE, '```'], tk('Start or leave a code block'), tk('Type ``` alone on a line, then Enter, to start one. Each Enter is a new line of code; Enter on an empty last line, or Esc, goes back to prose.')],
-        [[KMATH, '$…$'], tk('Inline maths, written in LaTeX'), tk('Type $ around the formula, or select it and press the keys. Click it, or Backspace just after it, to edit it.')]
+        [[KMATH, '$…$'], tk('Maths, set on a line of its own'), tk('Type $ around the formula, in AsciiMath (sum_(k=1)^n k) or LaTeX (\\frac{a}{b}), or select it and press the keys. Click it, or Backspace just after it, to edit it.')]
       ] : []),
       [KDA, tk('Move selected text to Darlings')],
       ...(more ? [[K('⌘⇧U', IS_LINUX ? 'Ctrl+Shift+K' : 'Ctrl+Shift+U'), tk('Read aloud from the cursor'), tk('Again, Esc or any key stops it. Uses your computer’s own voice.')]] : [])
@@ -15896,8 +15933,8 @@ function manuscriptSections() {
   const { sections } = exportChapters();
   return sections.filter((s) => s.kind === 'chapter' || s.kind === 'part' || s.kind === 'epigraph').map((s) => ({
     kind: s.kind, heading: s.heading || '', partTitle: s.partTitle || '',
-    paras: s.paras.map((p) => ({ sceneBreak: p.sceneBreak, poetry: p.poetry, flush: p.flush || p.code, align: p.align,
-      runs: p.code ? [{ text: p.text }] : (p.runs || []).map((r) => (r.m ? { ...r, text: '$' + r.text + '$', m: false } : r)) })),
+    paras: s.paras.map((p) => ({ sceneBreak: p.sceneBreak, poetry: p.poetry, flush: p.flush, align: p.align,
+      code: p.code, text: p.code ? p.text : undefined, runs: p.code ? [{ text: p.text }] : p.runs || [] })),
     words: s.paras.reduce((n, p) => n + (p.sceneBreak ? 0 : countWords(p.text || '')), 0)
   }));
 }
@@ -15936,7 +15973,11 @@ function manuscriptModel(v, sections) {
     font: v.font, paper: window.neo.paper || 'Letter', lang: writingLanguage(),
     // one story with no chapters: the short-story layout
     short: sections.length === 1 && chapters.length === 1 && !chapters[0].heading,
-    sections, words
+    // each formula carried set, for the page (MathML) and for Word (OMML)
+    sections: sections.map((s) => ({ ...s, paras: (s.paras || []).map((x) => (x.runs && x.runs.some((r) => r.m)
+      ? { ...x, runs: x.runs.map((r) => (r.m ? { ...r, mathml: mathMarkup(r.text) || '', omml: ommlOf(r.text) || '' } : r)) }
+      : x)) })),
+    words
   };
 }
 // Courier Prime (NEO's own Courier, bundled) goes into the PDF; Times New
@@ -16133,11 +16174,13 @@ function buildPrintHtml(d, o) {
   const prose = (paras, opening) => {
     let first = opening;
     let afterBreak = false;
-    return paras.map((p) => {
+    return paras.map((p, i) => {
       if (p.sceneBreak) { afterBreak = true; return '<p class="brk">*&#8195;*&#8195;*</p>'; }
       const inner = atFoot(p.html.replace(/^<p[^>]*>|<\/p>$/g, ''), p);
       if (p.poetry) { afterBreak = false; return `<p class="poetry"${p.align ? ` style="text-align:${p.align}"` : ''}>${inner}</p>`; }
-      if (p.code) return `<p class="code">${inner}</p>`;
+      // a code block's first and last lines marked, for the space around it
+      // (Paged.js sets no sibling rule there)
+      if (p.code) return `<p class="code${paras[i - 1] && paras[i - 1].code ? '' : ' top'}${paras[i + 1] && paras[i + 1].code ? '' : ' end'}">${inner}</p>`;
       const cls = ['hy'];
       if (first) cls.push('first');
       if (first && OPENING_DASH.test(p.text)) cls.push('dialogue');
@@ -16243,6 +16286,7 @@ function buildPrintHtml(d, o) {
   }
   body += back.map((x, i) => (i ? x.replace('class="backpage', 'class="backpage run-on') : x)).join('\n');
 
+  body = typesetMathHtml(body);
   const sz = trim.size;
   return `<!DOCTYPE html>
 <html lang="${esc(d.language || writingLanguage())}"><head><meta charset="utf-8"><title>${esc(d.title)}</title>
@@ -16312,9 +16356,9 @@ p.brk { text-align: center; margin: 0.7em 0; break-after: avoid; letter-spacing:
 p.poetry { margin: 0.5em 1.5em; text-align: left; }
 p.poetry + p.poetry { margin-top: 0; }
 p.code { font-family: "Courier Prime", "Courier New", monospace; font-size: 0.8em; line-height: 1.4; text-indent: 0; text-align: left; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; }
-p.code:not(p.code + p.code) { margin-top: 0.7em; }
-p.code:not(:has(+ p.code)) { margin-bottom: 0.7em; }
-.math { font-family: "Courier Prime", "Courier New", monospace; font-size: 0.86em; white-space: pre-wrap; }
+p.code.top { margin-top: 0.7em; }
+p.code.end { margin-bottom: 0.7em; }
+math { display: block math; text-align: center; text-indent: 0; margin: 0.45em 0; font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; }
 .backpage p.hy { text-indent: 0; margin-bottom: 0.7em; }
 .also p { text-align: center; font-style: italic; margin: 0 0 0.45em; }
 .note .reach-hd { margin-top: 1.4em; text-align: center; letter-spacing: 0.18em; text-transform: uppercase; font-size: 0.85em; }
@@ -16723,6 +16767,7 @@ function buildHtml(data, opts = {}) {
     body += sectionHtml(ch);
   }
   if (!placed) body += contents;
+  body = typesetMathHtml(body);
   return `<!DOCTYPE html>
 <html lang="${escHtml(d.language || writingLanguage())}"><head><meta charset="utf-8"><title>${escHtml(d.title)}</title>
 <style>
@@ -16754,10 +16799,10 @@ function buildHtml(data, opts = {}) {
   .chapter .brk, .brk { text-align: center; text-indent: 0 !important; letter-spacing: 8px; color: #888; margin: 2.5em 0; }
   .chapter p.poetry { text-indent: 0; margin: 0 2.5em; }
   .chapter p.flush { text-indent: 0 !important; }
-  p.code { font-family: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.82em; line-height: 1.5; text-indent: 0 !important; margin: 0; padding: 0 0.9em; white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; background: #f2f2f0; }
-  p.code:not(p.code + p.code) { margin-top: 0.9em; padding-top: 0.5em; }
-  p.code:not(:has(+ p.code)) { margin-bottom: 0.9em; padding-bottom: 0.5em; }
-  .math { font-family: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.88em; white-space: pre-wrap; }
+  p.code { font-family: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.82em; line-height: 1.5; text-indent: 0 !important; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; }
+  p.code:not(p.code + p.code) { margin-top: 0.9em; }
+  p.code:not(:has(+ p.code)) { margin-bottom: 0.9em; }
+  math { display: block math; text-align: center; text-indent: 0; margin: 0.45em 0; font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; font-size: 1.1em; }
   .chapter p:not(.poetry) + p.poetry, .chapter .hd + p.poetry { margin-top: 0.9em; }
   .chapter p.poetry + p:not(.poetry) { margin-top: 0.9em; }
   .chapter p.byline { text-align: center; margin: -24px 0 40px; letter-spacing: 3px; text-transform: uppercase; font-size: 10pt; color: #555; }
@@ -16818,6 +16863,14 @@ ${body}
 ${opts.stamp ? `<p class="prov">${t('{n} words · exported from NEO on {date}', { n: total, date: stamp })}</p>` : ''}
 </body></html>`;
 }
+
+// the maths spans runHtml wrote, typeset for a page that is printed or read
+// in a browser (one that can't be read stays as typed)
+const MATH_HTML = /<span class="math" contenteditable="false">([^<]*)<\/span>/g;
+const typesetMathHtml = (html) => html.replace(MATH_HTML, (all, tex) => {
+  const src = tex.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+  return mathMarkup(src) || `<span class="math">${tex}</span>`;
+});
 
 /* ---------- runs: paragraphs broken into styled text pieces ---------- */
 
@@ -16992,6 +17045,95 @@ function paraRuns(pHtml, flip) {
 
 /* ---------- DOCX ---------- */
 
+// A formula as a Word equation (OMML), from the MathML it is set in on the
+// page, so Word draws the same maths: null if it can't be read.
+const NARY_OPS = '∑∏∐∫∬∭∮⋃⋂⋁⋀';
+// (the operator itself, or an mrow holding only it, as temml writes a \sum)
+const naryEl = (n) => (n && n.localName === 'mrow' && n.children.length === 1 ? n.children[0] : n);
+const naryOp = (n) => {
+  n = naryEl(n);
+  if (!n || !/^(munderover|munder|mover|msubsup|msub|msup)$/.test(n.localName)) return '';
+  const base = n.children[0];
+  const op = base && base.localName === 'mo' ? base.textContent.trim() : '';
+  return NARY_OPS.includes(op) && op.length === 1 ? op : '';
+};
+function ommlKids(n) {
+  const kids = [...n.children];
+  let out = '';
+  for (let i = 0; i < kids.length; i++) {
+    // a sum or an integral takes what follows it as its body
+    if (naryOp(kids[i])) { out += ommlNode(naryEl(kids[i]), kids[i + 1] ? ommlNode(kids[i + 1]) : ''); i++; } else out += ommlNode(kids[i]);
+  }
+  return out;
+}
+function ommlNode(n, body = '') {
+  const k = [...n.children];
+  const e = (x) => (x ? ommlNode(x) : '');
+  const name = n.localName;
+  if (name === 'mi' || name === 'mn' || name === 'mo' || name === 'mtext') {
+    const text = n.textContent;
+    if (!text) return '';
+    // a one-letter name is italic, as in print; numbers, operators, words upright
+    const upright = name !== 'mi' || [...text].length > 1 || n.getAttribute('mathvariant') === 'normal';
+    return `<m:r>${upright ? '<m:rPr><m:sty m:val="p"/></m:rPr>' : ''}<m:t xml:space="preserve">${escXml(text)}</m:t></m:r>`;
+  }
+  const op = naryOp(n);
+  if (op) {
+    const sub = /under|sub/.test(name) ? k[1] : null;
+    const sup = name === 'munderover' || name === 'msubsup' ? k[2] : name === 'mover' || name === 'msup' ? k[1] : null;
+    const loc = /^mu|^mo/.test(name) ? 'undOvr' : 'subSup';
+    return `<m:nary><m:naryPr><m:chr m:val="${op}"/><m:limLoc m:val="${loc}"/>${sub ? '' : '<m:subHide m:val="1"/>'}${sup ? '' : '<m:supHide m:val="1"/>'}</m:naryPr><m:sub>${e(sub)}</m:sub><m:sup>${e(sup)}</m:sup><m:e>${body}</m:e></m:nary>`;
+  }
+  switch (name) {
+    case 'msup': return `<m:sSup><m:e>${e(k[0])}</m:e><m:sup>${e(k[1])}</m:sup></m:sSup>`;
+    case 'msub': return `<m:sSub><m:e>${e(k[0])}</m:e><m:sub>${e(k[1])}</m:sub></m:sSub>`;
+    case 'msubsup': return `<m:sSubSup><m:e>${e(k[0])}</m:e><m:sub>${e(k[1])}</m:sub><m:sup>${e(k[2])}</m:sup></m:sSubSup>`;
+    case 'mfrac': return `<m:f><m:num>${e(k[0])}</m:num><m:den>${e(k[1])}</m:den></m:f>`;
+    case 'msqrt': return `<m:rad><m:radPr><m:degHide m:val="1"/></m:radPr><m:deg/><m:e>${ommlKids(n)}</m:e></m:rad>`;
+    case 'mroot': return `<m:rad><m:deg>${e(k[1])}</m:deg><m:e>${e(k[0])}</m:e></m:rad>`;
+    case 'munder': return `<m:limLow><m:e>${e(k[0])}</m:e><m:lim>${e(k[1])}</m:lim></m:limLow>`;
+    case 'mover': return `<m:limUpp><m:e>${e(k[0])}</m:e><m:lim>${e(k[1])}</m:lim></m:limUpp>`;
+    case 'munderover': return `<m:limUpp><m:e><m:limLow><m:e>${e(k[0])}</m:e><m:lim>${e(k[1])}</m:lim></m:limLow></m:e><m:lim>${e(k[2])}</m:lim></m:limUpp>`;
+    case 'mtable': return `<m:m>${k.map((tr) => `<m:mr>${[...tr.children].map((td) => `<m:e>${ommlKids(td)}</m:e>`).join('')}</m:mr>`).join('')}</m:m>`;
+    case 'semantics': return e(k[0]);
+    case 'mspace': case 'annotation': case 'annotation-xml': return '';
+    default: return ommlKids(n);
+  }
+}
+function ommlOf(src) {
+  const ml = mathMarkup(src, true);
+  if (!ml) return null;
+  const doc = new DOMParser().parseFromString(ml, 'application/xml');
+  if (doc.getElementsByTagName('parsererror').length) return null;
+  return `<m:oMath>${ommlKids(doc.documentElement)}</m:oMath>`;
+}
+// A paragraph with maths in it, for Word: each formula an equation of its
+// own, centred, as on the page, and the words after it carry on below it
+// without an indent. para(runs, opts) sets the words; after(opts) is the
+// paragraph that carries on; eq(omml) the equation's own paragraph.
+function docxMathSplit(runs, opts, para, after, eq) {
+  if (!runs.some((r) => r.m)) return [para(runs, opts)];
+  const out = [];
+  let words = [];
+  let o = opts;
+  const flush = () => {
+    // the words after an equation start their line: no space in front
+    if (out.length && words[0] && words[0].text) words[0] = { ...words[0], text: words[0].text.replace(/^\s+/, '') };
+    if (words.some((r) => (r.text && r.text.trim()) || r.fn !== undefined)) out.push(para(words, o));
+    words = [];
+  };
+  for (const r of runs) {
+    const omml = r.m ? (r.omml || ommlOf(r.text)) : null;
+    if (!omml) { words.push(r); continue; }
+    flush();
+    out.push(eq(omml));
+    o = after(opts);
+  }
+  flush();
+  return out;
+}
+const M_NS = 'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"';
+
 // a Word export's footnotes, gathered as docxP meets them (buildDocxEntries)
 let docxNotes = null;
 function docxP(runs, opts = {}) {
@@ -17000,7 +17142,8 @@ function docxP(runs, opts = {}) {
   if (opts.style) pPr.push(`<w:pStyle w:val="${opts.style}"/>`);
   if (opts.keepNext) pPr.push('<w:keepNext/>');
   if (opts.pageBreak) pPr.push('<w:pageBreakBefore/>');
-  if (opts.spaceBefore || opts.spaceAfter) {
+  if (opts.spacing) pPr.push(opts.spacing);
+  else if (opts.spaceBefore || opts.spaceAfter) {
     pPr.push(`<w:spacing${opts.spaceBefore ? ` w:before="${opts.spaceBefore}"` : ''}${opts.spaceAfter ? ` w:after="${opts.spaceAfter}"` : ''} w:line="360" w:lineRule="auto"/>`);
   }
   if (opts.poetry) pPr.push('<w:ind w:left="720" w:right="720"/>');
@@ -17031,6 +17174,11 @@ function docxP(runs, opts = {}) {
   }).join('');
   return `<w:p><w:pPr>${pPr.join('')}</w:pPr>${rXml}</w:p>`;
 }
+
+// a paragraph of the book for Word, its formulas set as equations
+const docxMath = (runs, opts) => docxMathSplit(runs, opts, docxP,
+  (o) => (o.style === 'BodyText' ? { ...o, style: 'BodyTextNoIndent' } : o),
+  (omml) => `<w:p><w:pPr><w:pStyle w:val="BodyTextNoIndent"/><w:jc w:val="center"/></w:pPr><m:oMathPara>${omml}</m:oMathPara></w:p>`);
 
 function buildDocxEntries(data) {
   docxNotes = [];
@@ -17101,17 +17249,21 @@ function docxEntriesOf(data) {
     // the prose by paragraph style: Body Text (indented), Body Text No
     // Indent (a flush paragraph), Poetry, Scene Break; only a centered or
     // right-set line adds its alignment on top
-    for (const p of ch.paras) {
+    ch.paras.forEach((p, i) => {
+      // a code block breathes above and below, as on the page
+      const edge = (q) => !(q && q.code);
+      const codeSpace = p.code && (edge(ch.paras[i - 1]) || edge(ch.paras[i + 1]))
+        ? `<w:spacing w:before="${edge(ch.paras[i - 1]) ? 180 : 0}" w:after="${edge(ch.paras[i + 1]) ? 180 : 0}" w:line="240" w:lineRule="auto"/>` : '';
       if (p.sceneBreak) body.push(docxP([{ text: '***' }], { style: 'SceneBreak' }));
-      else if (p.code) body.push(docxP(p.text ? [{ text: p.text }] : [], { style: 'Code' }));
-      else if (p.poetry) body.push(docxP(paraRuns(p.html), { style: 'Poetry', align: p.align === 'center' || p.align === 'right' ? p.align : '' }));
-      else if (p.align === 'center' || p.align === 'right') body.push(docxP(paraRuns(p.html), { style: 'BodyTextNoIndent', align: p.align }));
-      else body.push(docxP(paraRuns(p.html), { style: p.flush ? 'BodyTextNoIndent' : 'BodyText' }));
-    }
+      else if (p.code) body.push(docxP(p.text ? [{ text: p.text }] : [], { style: 'Code', spacing: codeSpace }));
+      else if (p.poetry) body.push(...docxMath(paraRuns(p.html), { style: 'Poetry', align: p.align === 'center' || p.align === 'right' ? p.align : '' }));
+      else if (p.align === 'center' || p.align === 'right') body.push(...docxMath(paraRuns(p.html), { style: 'BodyTextNoIndent', align: p.align }));
+      else body.push(...docxMath(paraRuns(p.html), { style: p.flush ? 'BodyTextNoIndent' : 'BodyText' }));
+    });
   });
   if (!placed) contents();
   const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${body.join('')}
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ${M_NS}><w:body>${body.join('')}
 <w:sectPr>${(window.neo.paper || 'Letter') === 'A4' ? '<w:pgSz w:w="11906" w:h="16838"/>' : '<w:pgSz w:w="12240" w:h="15840"/>'}<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>
 </w:body></w:document>`;
   // the page's own typeface (on Linux, the bundled face it shows)
@@ -17128,7 +17280,7 @@ function docxEntriesOf(data) {
 ${para('BodyText', 'Body Text', '<w:ind w:firstLine="480"/>')}
 ${para('BodyTextNoIndent', 'Body Text No Indent', '', 'BodyText')}
 ${para('Poetry', 'Poetry', '<w:ind w:left="720" w:right="720"/>')}
-${para('Code', 'Code', '<w:spacing w:after="0" w:line="240" w:lineRule="auto"/><w:ind w:left="360"/>', 'Code', '<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="20"/>')}
+${para('Code', 'Code', '<w:spacing w:after="0" w:line="240" w:lineRule="auto"/>', 'Code', '<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="20"/>')}
 ${para('SceneBreak', 'Scene Break', '<w:spacing w:before="240"/><w:jc w:val="center"/>', 'BodyText')}
 ${para('Title', 'Title', '<w:spacing w:before="3000"/><w:jc w:val="center"/>', 'Normal', '<w:b/><w:sz w:val="56"/>')}
 ${para('Subtitle', 'Subtitle', '<w:jc w:val="center"/>', 'Normal', '<w:i/><w:sz w:val="32"/>')}
@@ -17199,7 +17351,7 @@ function chapterXhtml(ch, d) {
       fnN += 1;
       return `<sup class="fnref"><a epub:type="noteref" href="#fn${fnN}" id="fnr${fnN}">${fnN}</a></sup>`;
     }
-    if (r.m) return `<code class="math">${escXml(r.text)}</code>`;
+    if (r.m) return mathMarkup(r.text, true) || `<code class="math">${escXml(r.text)}</code>`;
     let t = escXml(r.text);
     if (r.s) t = '<s>' + t + '</s>';
     if (r.u) t = '<u>' + t + '</u>';
@@ -17281,7 +17433,7 @@ async function buildEpubEntries(data) {
   const start = rest[0] || chapters[0];
   if (!start) throw new Error(t('There’s nothing in this book to export yet'));
   const chItems = chapters.map((ch) =>
-    `<item id="ch${ch.num}" href="ch${ch.num}.xhtml" media-type="application/xhtml+xml"/>`).join('\n');
+    `<item id="ch${ch.num}" href="ch${ch.num}.xhtml" media-type="application/xhtml+xml"${ch.paras.some((p) => (p.runs || []).some((r) => r.m && mathMarkup(r.text))) ? ' properties="mathml"' : ''}/>`).join('\n');
   const spineOf = (list) => list.map((ch) => `<itemref idref="ch${ch.num}"/>`).join('\n');
   // one entry per section for a single book; a book of books nests its
   // chapters under their titles and its titles under their parts
@@ -17374,7 +17526,9 @@ p.brk { text-align: center; text-indent: 0; margin: 2.5em 0; letter-spacing: 0.5
 p.poetry { text-indent: 0; margin: 0 2em; }
 p.flush { text-indent: 0 !important; }
 p.code { font-family: monospace; font-size: 0.85em; text-indent: 0 !important; text-align: left; margin: 0; white-space: pre-wrap; -webkit-hyphens: none; -epub-hyphens: none; hyphens: none; }
+math { display: block; text-align: center; text-indent: 0; margin: 0.45em 0; font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; }
 code.math { font-family: monospace; font-size: 0.9em; }
+:not(.code) + p.code, p.code + :not(.code) { margin-top: 0.9em; }
 p:not(.poetry) + p.poetry, h1 + p.poetry { margin-top: 0.9em; }
 p.poetry + p:not(.poetry) { margin-top: 0.9em; }
 p.byline { text-align: center; text-indent: 0; letter-spacing: 0.2em; text-transform: uppercase; font-size: 0.8em; margin: -1em 0 2em; }

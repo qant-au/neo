@@ -174,6 +174,33 @@ test('Backspace just after a formula opens it for editing; the closing $ sets it
   assert.deepEqual(await js(`[...${body0}.children[0].querySelectorAll('.math')].map((s) => s.textContent)`), ['E = mc^2+1']);
 });
 
+test('maths shows typeset, centred on its own line, unshaded; code sits in the margins unshaded', async () => {
+  const look = await js(`(() => {
+    const span = ${body0}.children[0].querySelector('.math');
+    const cs = getComputedStyle(span);
+    const p = span.closest('p');
+    const code = ${body0}.querySelector('p.code');
+    const cc = getComputedStyle(code);
+    return {
+      wide: Math.round(span.getBoundingClientRect().width - p.getBoundingClientRect().width),
+      math: !!(span.shadowRoot && span.shadowRoot.querySelector('math msup')),
+      display: cs.display, align: cs.textAlign, bg: cs.backgroundColor,
+      codeBg: cc.backgroundColor, codePad: cc.paddingLeft + ' ' + cc.paddingRight,
+      codeLeft: Math.round(code.getBoundingClientRect().left - p.getBoundingClientRect().left),
+      codeWidth: Math.round(code.getBoundingClientRect().width - p.getBoundingClientRect().width)
+    };
+  })()`);
+  assert.equal(look.math, true);
+  assert.equal(look.display, 'inline-block');
+  assert.equal(look.wide, 0);
+  assert.equal(look.align, 'center');
+  assert.equal(look.bg, 'rgba(0, 0, 0, 0)');
+  assert.equal(look.codeBg, 'rgba(0, 0, 0, 0)');
+  assert.equal(look.codePad, '0px 0px');
+  assert.equal(look.codeLeft, 0);
+  assert.equal(look.codeWidth, 0);
+});
+
 test('⌘⇧M over a selection makes it maths', async () => {
   await js(`(() => {
     const p = ${body0}.children[2];
@@ -209,11 +236,13 @@ test('plain text export: code indented line by line, maths in $', async () => {
   assert.match(txt, /\$E = mc\^2\+1\$/);
 });
 
-test('Web Page export: code lines and maths kept, monospaced', async () => {
+test('Web Page export: code lines unshaded, maths typeset', async () => {
   const html = fs.readFileSync(await exported('html', 'cm.html'), 'utf8');
   assert.match(html, /<p class="code"> {2}return s;<\/p>/);
-  assert.match(html, /<span class="math"[^>]*>E = mc\^2\+1<\/span>/);
+  assert.match(html, /<math display="block"[^>]*>.*<msup><mi>c<\/mi><mn[^>]*>2<\/mn><\/msup>/);
+  assert.doesNotMatch(html, /class="math"/);
   assert.match(html, /p\.code \{ font-family: ui-monospace/);
+  assert.doesNotMatch(html, /p\.code \{[^}]*background/);
 });
 
 test('Word export: the Code style and maths runs', async () => {
@@ -221,9 +250,12 @@ test('Word export: the Code style and maths runs', async () => {
   const doc = await zip.file('word/document.xml').async('string');
   const styles = await zip.file('word/styles.xml').async('string');
   assert.match(doc, /<w:pStyle w:val="Code"\/><\/w:pPr><w:r><w:t xml:space="preserve"> {2}return s;<\/w:t>/);
-  assert.match(doc, /<w:rStyle w:val="Maths"\/><\/w:rPr><w:t xml:space="preserve">E = mc\^2\+1<\/w:t>/);
+  // the formula a Word equation, centred on its own line
+  assert.match(doc, /<w:jc w:val="center"\/><\/w:pPr><m:oMathPara><m:oMath>.*<m:sSup><m:e><m:r><m:t xml:space="preserve">c<\/m:t>/);
+  assert.match(doc, /xmlns:m="http:\/\/schemas\.openxmlformats\.org\/officeDocument\/2006\/math"/);
   assert.match(styles, /w:styleId="Code"/);
-  assert.match(styles, /w:styleId="Maths"/);
+  // the code lines sit at the margin, as on the page
+  assert.doesNotMatch(styles.match(/<w:style [^>]*w:styleId="Code".*?<\/w:style>/)[0], /w:ind/);
 });
 
 test('EPUB export: code lines and maths', async () => {
@@ -232,7 +264,35 @@ test('EPUB export: code lines and maths', async () => {
   let all = '';
   for (const n of names) all += await zip.file(n).async('string');
   assert.match(all, /<p class="code"> {2}return s;<\/p>/);
-  assert.match(all, /<code class="math">E = mc\^2\+1<\/code>/);
+  assert.match(all, /<math xmlns="http:\/\/www\.w3\.org\/1998\/Math\/MathML" display="block"[^>]*>.*<msup><mi>c<\/mi>/);
+  const opf = await zip.file(Object.keys(zip.files).find((n) => /\.opf$/.test(n))).async('string');
+  assert.match(opf, /properties="mathml"/);
+});
+
+test('Manuscript Format: code in Courier at the margin, maths set (Word and PDF)', async () => {
+  const D = `document.getElementById('manuscript-dialog')`;
+  const to = saveTo('cm-ms.docx');
+  await js(`(() => { window.__ms = doExport('manuscript'); })()`);
+  await until(() => js(`!!${D}`));
+  await js(`${D}.querySelector('.ms-docx').click()`);
+  await until(() => fs.existsSync(to) && fs.statSync(to).size > 0);
+  await tick(300);
+  const zip = await JSZip.loadAsync(fs.readFileSync(to));
+  const doc = await zip.file('word/document.xml').async('string');
+  assert.match(doc, /<w:pStyle w:val="Code"\/><\/w:pPr><w:r><w:t xml:space="preserve"> {2}return s;<\/w:t>/);
+  assert.match(doc, /<m:oMathPara><m:oMath>/);
+  assert.doesNotMatch(doc, /\$E = mc/);
+  const html = await js(`NeoManuscript.html(manuscriptModel(manuscriptDefaults(), manuscriptSections()))`);
+  assert.match(html, /<p class="code"> {2}return s;<\/p>/);
+  assert.match(html, /<math display="block"/);
+});
+
+test('Paperback pages: code lines marked for the space around them, maths set', async () => {
+  const pb = await js(`buildPrintHtml(bookExportData(), { trim: '5.5x8.5', paper: 'cream', links: {}, alsoByText: '', reviewText: '', reviewWords: '' })`);
+  assert.match(pb, /<p class="code top">const s/);
+  assert.match(pb, /<p class="code end">x<\/p>/);
+  assert.match(pb, /<math display="block"/);
+  assert.doesNotMatch(pb, /class="math"/);
 });
 
 test('PDF export finishes', async () => {
