@@ -4187,9 +4187,29 @@ function mathGap(span) {
   gap.style.marginRight = sp ? `-${sp}px` : '';
 }
 const mathGapsIn = (p) => { if (p) for (const s of p.getElementsByClassName('math')) mathGap(s); };
+// where the opening paragraph's words start beside its drop cap, in ems of
+// the prose, for a code block set straight after it (styles.css, --cap-in)
+function capIndent(body) {
+  const p = body && body.querySelector('p[data-first]');
+  const next = p && p.nextElementSibling;
+  if (!next || !next.classList.contains('code') || !p.matches(CAP_P)) { if (body) body.style.removeProperty('--cap-in'); return; }
+  const w = document.createTreeWalker(p, NodeFilter.SHOW_TEXT);
+  const t = w.nextNode();
+  const cap = capLetter(p.textContent);
+  const at = t ? t.data.indexOf(cap) + cap.length : -1;
+  if (!cap || at < cap.length || at >= t.data.length) { body.style.removeProperty('--cap-in'); return; }
+  const r = document.createRange(); r.setStart(t, at); r.setEnd(t, at + 1);
+  const em = parseFloat(getComputedStyle(p).fontSize);
+  body.style.setProperty('--cap-in', ((r.getBoundingClientRect().left - p.getBoundingClientRect().left) / em).toFixed(3));
+}
+const capIndents = () => { for (const b of document.querySelectorAll('.chapter-body')) capIndent(b); };
+if (document.fonts) document.fonts.addEventListener('loadingdone', capIndents);
 new MutationObserver((list) => {
   for (const m of list) {
     // the drop cap set or taken off: the opening paragraphs' gaps follow it
+    const inBody = m.target.nodeType === Node.ELEMENT_NODE ? m.target.closest('.chapter-body') : m.target.parentNode && m.target.parentNode.closest && m.target.parentNode.closest('.chapter-body');
+    if (inBody) capIndent(inBody);
+    else if (m.type === 'attributes' && m.target === document.body) capIndents();
     if (m.type === 'attributes') {
       const t = m.target;
       if (t.nodeName === 'P') mathGapsIn(t);
@@ -16222,15 +16242,18 @@ function buildPrintHtml(d, o) {
   const prose = (paras, opening) => {
     let first = opening;
     let afterBreak = false;
+    let capRun = ''; // the opening paragraph's drop cap, for code set straight after it
     return paras.map((p, i) => {
+      if (!p.code) capRun = '';
       if (p.sceneBreak) { afterBreak = true; return '<p class="brk">*&#8195;*&#8195;*</p>'; }
       const inner = atFoot(p.html.replace(/^<p[^>]*>|<\/p>$/g, ''), p);
       if (p.poetry) { afterBreak = false; return `<p class="poetry"${p.align ? ` style="text-align:${p.align}"` : ''}>${inner}</p>`; }
       // a code block's first and last lines marked, for the space around it
       // (Paged.js sets no sibling rule there)
-      if (p.code) return `<p class="code${paras[i - 1] && paras[i - 1].code ? '' : ' top'}${paras[i + 1] && paras[i + 1].code ? '' : ' end'}">${inner}</p>`;
+      if (p.code) return capCode(`<p class="code${paras[i - 1] && paras[i - 1].code ? '' : ' top'}${paras[i + 1] && paras[i + 1].code ? '' : ' end'}">${inner}</p>`, capRun);
       const cls = ['hy'];
       if (first) cls.push('first');
+      if (first && cap && !OPENING_DASH.test(p.text)) capRun = capLetter(p.text);
       if (first && OPENING_DASH.test(p.text)) cls.push('dialogue');
       if (afterBreak || p.flush) cls.push('flush');
       first = false;
@@ -16400,7 +16423,10 @@ p { margin: 0; orphans: 2; widows: 2; }
 p.hy { text-align: justify; text-indent: 1.5em; hyphens: manual; -webkit-hyphens: manual; text-wrap: pretty; }
 p.hy.first, p.hy.flush { text-indent: 0; }
 ${cap ? `p.first:not(.dialogue)::first-letter, p.first:not(.dialogue) .mgap.cap::first-letter { initial-letter: 2; -webkit-initial-letter: 2; font-family: ${cap}; padding-right: 0.06em; }
-p.first:not(.dialogue) .mgap.cap { width: auto; }` : ''}
+p.first:not(.dialogue) .mgap.cap { width: auto; }
+p.code.capped { display: flex; margin-left: 0; }
+p.code.capped .mgap.cap { display: block; flex: none; width: auto; font-family: ${exportBodyFont()}; font-size: calc(1em / 0.8); line-height: 1.42; }
+p.code.capped .mgap.cap::first-letter { initial-letter: 2; -webkit-initial-letter: 2; font-family: ${cap}; padding-right: 0.06em; }` : ''}
 p.brk { text-align: center; margin: 0.7em 0; break-after: avoid; letter-spacing: 0.1em; }
 p.poetry { margin: 0.5em 1.5em; text-align: left; }
 p.poetry + p.poetry { margin-top: 0; }
@@ -16726,10 +16752,14 @@ function buildHtml(data, opts = {}) {
   const prose = (paras, initial) => {
     let first = initial;
     let afterBreak = false; // a story's line of speech after *** keeps its indent
+    let capRun = ''; // the opening paragraph's drop cap, for code set straight after it
+    const capped = (library.fonts || {}).dropcap !== 'none';
     return paras.map((p) => {
+      if (!p.code) capRun = '';
       if (p.sceneBreak) { afterBreak = initial; return '<p class="brk">***</p>'; }
       if (p.poetry) { afterBreak = false; return p.html; }
-      if (p.code) return p.html;
+      if (p.code) return capCode(p.html, capRun);
+      if (first && capped && !OPENING_DASH.test(p.text || '')) capRun = capLetter(p.text);
       let html = p.html;
       if (first || afterBreak) {
         const h = document.createElement('div');
@@ -16849,6 +16879,9 @@ function buildHtml(data, opts = {}) {
      that can't set one gets a raised initial. */
   ${(library.fonts || {}).dropcap === 'none' ? '' : `.chapter p.first:not(.dialogue)::first-letter, .chapter p.first:not(.dialogue) .mgap.cap::first-letter { -webkit-initial-letter: 2; initial-letter: 2; padding-right: 4px; font-family: ${exportDropCapFont()}; }
   .chapter p.first:not(.dialogue) .mgap.cap { width: auto; }
+  .chapter p.code.capped { display: flex; margin-left: 0; }
+  .chapter p.code.capped .mgap.cap { display: block; flex: none; width: auto; font-family: ${exportBodyFont()}; font-size: calc(1em / 0.82); line-height: 1.7; }
+  .chapter p.code.capped .mgap.cap::first-letter { -webkit-initial-letter: 2; initial-letter: 2; padding-right: 4px; font-family: ${exportDropCapFont()}; }
   @supports not ((initial-letter: 2) or (-webkit-initial-letter: 2)) { .chapter p.first:not(.dialogue)::first-letter, .chapter p.first:not(.dialogue) .mgap.cap::first-letter { font-size: 1.8em; line-height: 1; padding-right: 0; } }`}
   .chapter .brk, .brk { text-align: center; text-indent: 0 !important; letter-spacing: 8px; color: #888; margin: 2.5em 0; }
   .chapter p.poetry { text-indent: 0; margin: 0 2.5em; }
@@ -16937,6 +16970,10 @@ const typesetMathHtml = (html) => html.replace(MATH_HTML, (all, tex) => {
 // the words line up with the ones beside it, whatever the letter.
 const mathGapsInner = (inner, cap = '') => inner.replace(/(<\/math>)[ \t]*(?![ \t\n]*$)/g,
   `$1<span class="mgap${cap ? ` cap" data-cap="${escAttr(cap)}` : ''}"></span>`);
+// the code lines straight after a chapter's opening paragraph, given that
+// paragraph's drop cap letters: each opens with the same hidden copy of the
+// cap, so the block starts where the paragraph's words do beside the cap
+const capCode = (html, cap) => (cap ? html.replace(/^<p class="code([^"]*)">/, `<p class="code$1 capped"><span class="mgap cap" data-cap="${escAttr(cap)}"></span>`) : html);
 const mathGaps = (html) => html.replace(/(<p\b[^>]*>)([\s\S]*?)(<\/p>)/g, (all, open, inner, close) => {
   if (!inner.includes('</math>')) return all;
   let cap = '';

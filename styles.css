@@ -868,6 +868,12 @@ body.paged #paper:not(.script) #tp-author { font-size: calc(14px * var(--page-zo
   font-size: 0.82em; line-height: 1.55; text-indent: 0 !important; margin: 0 0 0 calc(2em / 0.82);
   white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; tab-size: 2;
 }
+/* a block straight after the chapter's opening paragraph, while its drop
+   cap is set, starts where that paragraph's words do beside the cap: --cap-in
+   is that offset in ems of the prose, measured by app.js (capIndent) */
+body:not(.no-dropcap) .chapter-body:not(.cap-off):not(.no-cap):not(.opens-dialogue) p[data-first] ~ p.code:not(p[data-first] ~ p:not(.code) ~ p.code) {
+  margin-left: calc(var(--cap-in, 2) * 1em / 0.82);
+}
 .chapter-body p.code:not(p.code + p.code) { margin-top: 0.9em; }
 .chapter-body p.code:not(:has(+ p.code)) { margin-bottom: 0.9em; }
 /* Maths (⌘⇧M, or $…$): the formula typeset (app.js sets it from the span's

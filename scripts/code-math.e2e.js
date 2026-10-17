@@ -197,6 +197,8 @@ test('maths shows typeset, centred on its own line, unshaded, the words after it
       afterLeft: Math.round(r.getBoundingClientRect().left - pl), indent: Math.round(2 * em),
       codeBg: cc.backgroundColor, codePad: cc.paddingLeft + ' ' + cc.paddingRight,
       codeLeft: Math.round(code.getBoundingClientRect().left - pl),
+      // straight after the drop cap paragraph, the block starts beside the cap
+      codeWant: p.matches(CAP_P) && p.nextElementSibling === code ? (() => { const r2 = document.createRange(); r2.setStart(p.firstChild, 1); r2.setEnd(p.firstChild, 2); return Math.round(r2.getBoundingClientRect().left - pl); })() : Math.round(2 * em),
       codeRight: Math.round(p.getBoundingClientRect().right - code.getBoundingClientRect().right)
     };
   })()`);
@@ -209,7 +211,7 @@ test('maths shows typeset, centred on its own line, unshaded, the words after it
   assert.equal(look.afterLeft, look.indent);
   assert.equal(look.codeBg, 'rgba(0, 0, 0, 0)');
   assert.equal(look.codePad, '0px 0px');
-  assert.equal(look.codeLeft, look.indent);
+  assert.equal(look.codeLeft, look.codeWant);
   assert.equal(look.codeRight, 0);
 });
 
@@ -232,6 +234,11 @@ test('in the drop cap paragraph, the words after a formula line up with the word
   assert.equal(at.capped, true);
   assert.ok(at.beside > 0 && at.beside !== at.indent, JSON.stringify(at));
   assert.equal(at.after, at.beside);
+  // and the code block straight after it starts there too
+  assert.equal(await js(`(() => { const p = ${body0}.children[0]; const c = p.nextElementSibling; return c.classList.contains('code') ? Math.round(c.getBoundingClientRect().left - p.getBoundingClientRect().left) : 'no code'; })()`), at.beside);
+  // a block after any other paragraph keeps the paragraph indent
+  const later = await js(`(() => { const b = ${body0}; const c = [...b.querySelectorAll('p.code')].find((q) => q.previousElementSibling && !q.previousElementSibling.matches('[data-first], .code')); return c ? Math.round(c.getBoundingClientRect().left - b.getBoundingClientRect().left) : null; })()`);
+  if (later !== null) assert.equal(later, at.indent);
   // the drop cap off: the gap goes back to the indent
   await js(`document.body.classList.add('no-dropcap')`);
   await tick(100);
@@ -292,6 +299,7 @@ test('plain text export: code indented line by line, maths in $', async () => {
 test('Web Page export: code lines unshaded, maths typeset', async () => {
   const html = fs.readFileSync(await exported('html', 'cm.html'), 'utf8');
   assert.match(html, /<p class="code"> {2}return s;<\/p>/);
+  assert.match(html, /<p class="code capped"><span class="mgap cap" data-cap="T"><\/span>ls -la<\/p>/);
   assert.match(html, /<math display="block"[^>]*>.*<msup><mi>c<\/mi><mn[^>]*>2<\/mn><\/msup>/);
   assert.doesNotMatch(html, /class="math"/);
   assert.match(html, /p\.code \{ font-family: ui-monospace/);
@@ -353,7 +361,9 @@ test('Manuscript Format: code in Courier at the indent, maths set (Word and PDF)
 
 test('Paperback pages: code lines marked for the space around them, maths set', async () => {
   const pb = await js(`buildPrintHtml(bookExportData(), { trim: '5.5x8.5', paper: 'cream', links: {}, alsoByText: '', reviewText: '', reviewWords: '' })`);
+  // straight after the opening paragraph: the block opens with a hidden copy of its drop cap
   assert.match(pb, /<p class="code top">const s/);
+  assert.match(pb, /<p class="code top end capped"><span class="mgap cap" data-cap="T"><\/span>ls -la<\/p>/);
   assert.match(pb, /<p class="code end">x<\/p>/);
   assert.match(pb, /<math display="block"/);
   assert.match(pb, /<\/math><span class="mgap cap" data-cap="[^"]+"><\/span>and more/);
