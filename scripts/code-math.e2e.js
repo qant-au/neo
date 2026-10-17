@@ -213,6 +213,33 @@ test('maths shows typeset, centred on its own line, unshaded, the words after it
   assert.equal(look.codeRight, 0);
 });
 
+test('in the drop cap paragraph, the words after a formula line up with the words beside the cap', async () => {
+  // the caret out of the paragraph, so the drop cap is set
+  await js(`placeCaret(${body0}.children[2], 0)`);
+  await tick(300);
+  const at = await js(`(() => {
+    const p = ${body0}.children[0];
+    const left = p.getBoundingClientRect().left;
+    const t = p.firstChild;
+    const r = document.createRange(); r.setStart(t, 1); r.setEnd(t, 2);
+    const span = p.querySelector('.math');
+    const after = span.nextSibling;
+    const i = after.data.search(/\\S/);
+    const r2 = document.createRange(); r2.setStart(after, i); r2.setEnd(after, i + 1);
+    return { capped: p.matches(CAP_P), beside: Math.round(r.getBoundingClientRect().left - left), after: Math.round(r2.getBoundingClientRect().left - left),
+      indent: Math.round(2 * parseFloat(getComputedStyle(p).fontSize)) };
+  })()`);
+  assert.equal(at.capped, true);
+  assert.ok(at.beside > 0 && at.beside !== at.indent, JSON.stringify(at));
+  assert.equal(at.after, at.beside);
+  // the drop cap off: the gap goes back to the indent
+  await js(`document.body.classList.add('no-dropcap')`);
+  await tick(100);
+  const off = await js(`(() => { const p = ${body0}.children[0]; const span = p.querySelector('.math'); const after = span.nextSibling; const i = after.data.search(/\\S/); const r = document.createRange(); r.setStart(after, i); r.setEnd(after, i + 1); return Math.round(r.getBoundingClientRect().left - p.getBoundingClientRect().left); })()`);
+  await js(`document.body.classList.remove('no-dropcap')`);
+  assert.equal(off, at.indent);
+});
+
 test('a formula that ends its paragraph opens no gap after it', async () => {
   const hidden = `${body0}.children[0].querySelector('.math').shadowRoot.querySelector('.gap').hidden`;
   await js(`(() => {
@@ -271,7 +298,8 @@ test('Web Page export: code lines unshaded, maths typeset', async () => {
   assert.doesNotMatch(html, /p\.code \{[^}]*background/);
   // code set in at the paragraph indent; the words after a formula open at it
   assert.match(html, /p\.code \{[^}]*margin: 0 0 0 calc\(2em \/ 0\.82\)/);
-  assert.match(html, /<\/math><span class="mgap"><\/span>and more/);
+  assert.match(html, /<\/math><span class="mgap cap" data-cap="[^"]+"><\/span>and more/);
+  assert.match(html, /\.chapter p\.first:not\(\.dialogue\) \.mgap\.cap::first-letter/);
 });
 
 test('Word export: the Code style and maths runs', async () => {
@@ -328,7 +356,7 @@ test('Paperback pages: code lines marked for the space around them, maths set', 
   assert.match(pb, /<p class="code top">const s/);
   assert.match(pb, /<p class="code end">x<\/p>/);
   assert.match(pb, /<math display="block"/);
-  assert.match(pb, /<\/math><span class="mgap"><\/span>and more/);
+  assert.match(pb, /<\/math><span class="mgap cap" data-cap="[^"]+"><\/span>and more/);
   assert.doesNotMatch(pb, /class="math"/);
 });
 

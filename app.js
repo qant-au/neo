@@ -4140,6 +4140,8 @@ function mathMarkup(src, xml = false) {
 const MATH_SHEET = new CSSStyleSheet();
 MATH_SHEET.replaceSync(`.box { display: inline-block; width: 100%; text-align: center; text-indent: 0; margin: 0.45em 0; vertical-align: middle; }
 .gap { display: inline-block; width: 2em; }
+.gap.cap { width: auto; height: 0; overflow: hidden; visibility: hidden; vertical-align: baseline; font-size: 3.4em; line-height: 0.8; padding-right: 8px; font-family: var(--dropcap-font); }
+.gap.cap::before { content: attr(data-cap); }
 .gap[hidden], :host-context(p.flush) .gap, :host-context(p.poetry) .gap, :host-context(p[style*="text-align"]) .gap { display: none; }
 math { font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; font-size: 1.1em; text-indent: 0; }
 .raw { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.82em; white-space: pre-wrap; }`);
@@ -4152,8 +4154,15 @@ function typesetMath(span) {
   root.innerHTML = `<span class="box">${mathMarkup(tex) || `<span class="raw">${escHtml(tex)}</span>`}</span><span class="gap"></span>`;
   mathGap(span);
 }
+// the paragraphs the drop cap is set in (the ::first-letter rule in styles.css)
+const CAP_P = 'body:not(.no-dropcap) .chapter-body:not(.cap-off):not(.no-cap):not(.opens-dialogue) p[data-first]';
+// the letters ::first-letter takes: any punctuation in front, then the letter
+const capLetter = (text) => ((text || '').match(/^\s*([\p{P}]*[^\s\p{P}])/u) || [])[1] || '';
 // the gap that sets the words after a formula in at the indent opens only
-// when words follow it: at the end of a paragraph it would be a line of its own
+// when words follow it: at the end of a paragraph it would be a line of its
+// own. In the paragraph with the drop cap, the indent is where its first
+// lines start, beside the letter: the gap is a hidden copy of the drop cap,
+// so it is exactly as wide, whatever the letter.
 function mathGap(span) {
   const gap = span.shadowRoot && span.shadowRoot.querySelector('.gap');
   if (!gap) return;
@@ -4164,6 +4173,10 @@ function mathGap(span) {
     else words = !!n.textContent || (n.classList && n.classList.contains('fn'));
   }
   gap.hidden = !words;
+  const p = span.closest('p');
+  const cap = p && p.matches(CAP_P) ? capLetter(p.textContent) : '';
+  gap.classList.toggle('cap', !!cap);
+  if (cap) gap.dataset.cap = cap;
   // the space typed after the formula starts that line too: the gap gives
   // its width back, so the first word sits on the indent exactly
   let t = span.nextSibling;
@@ -4176,6 +4189,13 @@ function mathGap(span) {
 const mathGapsIn = (p) => { if (p) for (const s of p.getElementsByClassName('math')) mathGap(s); };
 new MutationObserver((list) => {
   for (const m of list) {
+    // the drop cap set or taken off: the opening paragraphs' gaps follow it
+    if (m.type === 'attributes') {
+      const t = m.target;
+      if (t.nodeName === 'P') mathGapsIn(t);
+      else if (t === document.body || t.classList.contains('chapter-body')) for (const q of t.querySelectorAll('p[data-first]')) mathGapsIn(q);
+      continue;
+    }
     if (m.type === 'characterData') { mathGapsIn(m.target.parentNode && m.target.parentNode.closest && m.target.parentNode.closest('p')); continue; }
     for (const n of m.addedNodes) {
       if (n.nodeType !== Node.ELEMENT_NODE) continue;
@@ -4184,7 +4204,7 @@ new MutationObserver((list) => {
     }
     if (m.target.nodeType === Node.ELEMENT_NODE) mathGapsIn(m.target.closest('p'));
   }
-}).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+}).observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['class', 'data-first'] });
 // the caret on the far side of an atom (a maths span, a footnote's number):
 // in the text that follows it, made if there's none, so typing goes there
 function caretPast(atom) {
@@ -16379,7 +16399,8 @@ p { margin: 0; orphans: 2; widows: 2; }
 .ch-title.ch-only { font-size: ${(sz * 1.35).toFixed(1)}pt; letter-spacing: 0.06em; }
 p.hy { text-align: justify; text-indent: 1.5em; hyphens: manual; -webkit-hyphens: manual; text-wrap: pretty; }
 p.hy.first, p.hy.flush { text-indent: 0; }
-${cap ? `p.first:not(.dialogue)::first-letter { initial-letter: 2; -webkit-initial-letter: 2; font-family: ${cap}; padding-right: 0.06em; }` : ''}
+${cap ? `p.first:not(.dialogue)::first-letter, p.first:not(.dialogue) .mgap.cap::first-letter { initial-letter: 2; -webkit-initial-letter: 2; font-family: ${cap}; padding-right: 0.06em; }
+p.first:not(.dialogue) .mgap.cap { width: auto; }` : ''}
 p.brk { text-align: center; margin: 0.7em 0; break-after: avoid; letter-spacing: 0.1em; }
 p.poetry { margin: 0.5em 1.5em; text-align: left; }
 p.poetry + p.poetry { margin-top: 0; }
@@ -16388,6 +16409,8 @@ p.code.top { margin-top: 0.7em; }
 p.code.end { margin-bottom: 0.7em; }
 math { display: block math; text-align: center; text-indent: 0; margin: 0.45em 0; font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; }
 .mgap { display: inline-block; width: 1.5em; }
+.mgap.cap { height: 0; overflow: hidden; visibility: hidden; vertical-align: baseline; }
+.mgap.cap::before { content: attr(data-cap); }
 p.flush .mgap, p.poetry .mgap, p[style*="text-align"] .mgap { display: none; }
 .backpage p.hy { text-indent: 0; margin-bottom: 0.7em; }
 .also p { text-align: center; font-style: italic; margin: 0 0 0.45em; }
@@ -16824,8 +16847,9 @@ function buildHtml(data, opts = {}) {
      search, and screen readers still find "The" where a float leaves "T"
      and "he" (a gap much wider than 4px splits the word again). A browser
      that can't set one gets a raised initial. */
-  ${(library.fonts || {}).dropcap === 'none' ? '' : `.chapter p.first:not(.dialogue)::first-letter { -webkit-initial-letter: 2; initial-letter: 2; padding-right: 4px; font-family: ${exportDropCapFont()}; }
-  @supports not ((initial-letter: 2) or (-webkit-initial-letter: 2)) { .chapter p.first:not(.dialogue)::first-letter { font-size: 1.8em; line-height: 1; padding-right: 0; } }`}
+  ${(library.fonts || {}).dropcap === 'none' ? '' : `.chapter p.first:not(.dialogue)::first-letter, .chapter p.first:not(.dialogue) .mgap.cap::first-letter { -webkit-initial-letter: 2; initial-letter: 2; padding-right: 4px; font-family: ${exportDropCapFont()}; }
+  .chapter p.first:not(.dialogue) .mgap.cap { width: auto; }
+  @supports not ((initial-letter: 2) or (-webkit-initial-letter: 2)) { .chapter p.first:not(.dialogue)::first-letter, .chapter p.first:not(.dialogue) .mgap.cap::first-letter { font-size: 1.8em; line-height: 1; padding-right: 0; } }`}
   .chapter .brk, .brk { text-align: center; text-indent: 0 !important; letter-spacing: 8px; color: #888; margin: 2.5em 0; }
   .chapter p.poetry { text-indent: 0; margin: 0 2.5em; }
   .chapter p.flush { text-indent: 0 !important; }
@@ -16834,6 +16858,8 @@ function buildHtml(data, opts = {}) {
   p.code:not(:has(+ p.code)) { margin-bottom: 0.9em; }
   math { display: block math; text-align: center; text-indent: 0; margin: 0.45em 0; font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; font-size: 1.1em; }
   .mgap { display: inline-block; width: 2em; }
+  .mgap.cap { height: 0; overflow: hidden; visibility: hidden; vertical-align: baseline; }
+  .mgap.cap::before { content: attr(data-cap); }
   p.flush .mgap, p.poetry .mgap, p[style*="text-align"] .mgap { display: none; }
   .chapter p:not(.poetry) + p.poetry, .chapter .hd + p.poetry { margin-top: 0.9em; }
   .chapter p.poetry + p:not(.poetry) { margin-top: 0.9em; }
@@ -16905,8 +16931,18 @@ const typesetMathHtml = (html) => html.replace(MATH_HTML, (all, tex) => {
 });
 // the words after a set formula carry on at the paragraph's indent: a gap
 // that wide opens their line (each format's CSS sizes .mgap, and hides it
-// where the paragraph has no indent); none where the paragraph ends
-const mathGaps = (html) => html.replace(/(<\/math>)[ \t]*(?![ \t\n]*(?:<\/p>|$))/g, '$1<span class="mgap"></span>');
+// where the paragraph has no indent); none where the paragraph ends. In a
+// chapter's opening paragraph (p.first) the gap carries the drop cap's
+// letters, data-cap, which the CSS sets as a hidden copy of the drop cap, so
+// the words line up with the ones beside it, whatever the letter.
+const mathGapsInner = (inner, cap = '') => inner.replace(/(<\/math>)[ \t]*(?![ \t\n]*$)/g,
+  `$1<span class="mgap${cap ? ` cap" data-cap="${escAttr(cap)}` : ''}"></span>`);
+const mathGaps = (html) => html.replace(/(<p\b[^>]*>)([\s\S]*?)(<\/p>)/g, (all, open, inner, close) => {
+  if (!inner.includes('</math>')) return all;
+  let cap = '';
+  if (/class="[^"]*\bfirst\b/.test(open)) { const d = document.createElement('div'); d.innerHTML = inner; cap = capLetter(d.textContent); }
+  return open + mathGapsInner(inner, cap) + close;
+});
 
 /* ---------- runs: paragraphs broken into styled text pieces ---------- */
 
@@ -17379,7 +17415,7 @@ function chapterXhtml(ch, d) {
   // footnotes: the number is a link a reading app opens as a pop-up note
   let fnN = fnBefore(d, ch);
   const notes = [];
-  const xhtmlRuns = (p) => mathGaps(paraRuns(p.html).map((r) => {
+  const xhtmlRuns = (p) => mathGapsInner(paraRuns(p.html).map((r) => {
     if (r.br) return '<br/>';
     if (r.fn !== undefined) {
       notes.push(r.fn);
