@@ -174,20 +174,30 @@ test('Backspace just after a formula opens it for editing; the closing $ sets it
   assert.deepEqual(await js(`[...${body0}.children[0].querySelectorAll('.math')].map((s) => s.textContent)`), ['E = mc^2+1']);
 });
 
-test('maths shows typeset, centred on its own line, unshaded; code sits in the margins unshaded', async () => {
+test('maths shows typeset, centred on its own line, unshaded, the words after it at the indent; code set in at the indent, unshaded', async () => {
   const look = await js(`(() => {
     const span = ${body0}.children[0].querySelector('.math');
-    const cs = getComputedStyle(span);
+    const box = span.shadowRoot.querySelector('.box');
+    const cs = getComputedStyle(box);
     const p = span.closest('p');
+    const pl = p.getBoundingClientRect().left;
+    const em = parseFloat(getComputedStyle(p).fontSize);
     const code = ${body0}.querySelector('p.code');
     const cc = getComputedStyle(code);
+    // the first word after the formula
+    const after = span.nextSibling;
+    const r = document.createRange();
+    const at = after.data.search(/\\S/);
+    r.setStart(after, at); r.setEnd(after, at + 1);
     return {
-      wide: Math.round(span.getBoundingClientRect().width - p.getBoundingClientRect().width),
-      math: !!(span.shadowRoot && span.shadowRoot.querySelector('math msup')),
-      display: cs.display, align: cs.textAlign, bg: cs.backgroundColor,
+      wide: Math.round(box.getBoundingClientRect().width - p.getBoundingClientRect().width),
+      math: !!span.shadowRoot.querySelector('math msup'),
+      display: cs.display, align: cs.textAlign, bg: getComputedStyle(span).backgroundColor,
+      below: r.getBoundingClientRect().top >= box.getBoundingClientRect().bottom - 1,
+      afterLeft: Math.round(r.getBoundingClientRect().left - pl), indent: Math.round(2 * em),
       codeBg: cc.backgroundColor, codePad: cc.paddingLeft + ' ' + cc.paddingRight,
-      codeLeft: Math.round(code.getBoundingClientRect().left - p.getBoundingClientRect().left),
-      codeWidth: Math.round(code.getBoundingClientRect().width - p.getBoundingClientRect().width)
+      codeLeft: Math.round(code.getBoundingClientRect().left - pl),
+      codeRight: Math.round(p.getBoundingClientRect().right - code.getBoundingClientRect().right)
     };
   })()`);
   assert.equal(look.math, true);
@@ -195,10 +205,26 @@ test('maths shows typeset, centred on its own line, unshaded; code sits in the m
   assert.equal(look.wide, 0);
   assert.equal(look.align, 'center');
   assert.equal(look.bg, 'rgba(0, 0, 0, 0)');
+  assert.equal(look.below, true);
+  assert.equal(look.afterLeft, look.indent);
   assert.equal(look.codeBg, 'rgba(0, 0, 0, 0)');
   assert.equal(look.codePad, '0px 0px');
-  assert.equal(look.codeLeft, 0);
-  assert.equal(look.codeWidth, 0);
+  assert.equal(look.codeLeft, look.indent);
+  assert.equal(look.codeRight, 0);
+});
+
+test('a formula that ends its paragraph opens no gap after it', async () => {
+  const hidden = `${body0}.children[0].querySelector('.math').shadowRoot.querySelector('.gap').hidden`;
+  await js(`(() => {
+    const span = ${body0}.children[0].querySelector('.math');
+    window.__rest = [];
+    while (span.nextSibling) { window.__rest.push(span.nextSibling); span.nextSibling.remove(); }
+  })()`);
+  await tick(50);
+  assert.equal(await js(hidden), true);
+  await js(`${body0}.children[0].querySelector('.math').after(...window.__rest)`);
+  await tick(50);
+  assert.equal(await js(hidden), false);
 });
 
 test('⌘⇧M over a selection makes it maths', async () => {
@@ -243,6 +269,9 @@ test('Web Page export: code lines unshaded, maths typeset', async () => {
   assert.doesNotMatch(html, /class="math"/);
   assert.match(html, /p\.code \{ font-family: ui-monospace/);
   assert.doesNotMatch(html, /p\.code \{[^}]*background/);
+  // code set in at the paragraph indent; the words after a formula open at it
+  assert.match(html, /p\.code \{[^}]*margin: 0 0 0 calc\(2em \/ 0\.82\)/);
+  assert.match(html, /<\/math><span class="mgap"><\/span>and more/);
 });
 
 test('Word export: the Code style and maths runs', async () => {
@@ -254,8 +283,10 @@ test('Word export: the Code style and maths runs', async () => {
   assert.match(doc, /<w:jc w:val="center"\/><\/w:pPr><m:oMathPara><m:oMath>.*<m:sSup><m:e><m:r><m:t xml:space="preserve">c<\/m:t>/);
   assert.match(doc, /xmlns:m="http:\/\/schemas\.openxmlformats\.org\/officeDocument\/2006\/math"/);
   assert.match(styles, /w:styleId="Code"/);
-  // the code lines sit at the margin, as on the page
-  assert.doesNotMatch(styles.match(/<w:style [^>]*w:styleId="Code".*?<\/w:style>/)[0], /w:ind/);
+  // the code lines set in at the paragraph indent, as on the page
+  assert.match(styles.match(/<w:style [^>]*w:styleId="Code".*?<\/w:style>/)[0], /<w:ind w:left="480"\/>/);
+  // the words after the equation carry on at the indent: Body Text
+  assert.match(doc, /<\/m:oMathPara><\/w:p><w:p><w:pPr><w:pStyle w:val="BodyText"\/><\/w:pPr><w:r><w:t xml:space="preserve">and more/);
 });
 
 test('EPUB export: code lines and maths', async () => {
@@ -267,9 +298,10 @@ test('EPUB export: code lines and maths', async () => {
   assert.match(all, /<math xmlns="http:\/\/www\.w3\.org\/1998\/Math\/MathML" display="block"[^>]*>.*<msup><mi>c<\/mi>/);
   const opf = await zip.file(Object.keys(zip.files).find((n) => /\.opf$/.test(n))).async('string');
   assert.match(opf, /properties="mathml"/);
+  assert.match(all, /<\/math><span class="mgap"><\/span>and more/);
 });
 
-test('Manuscript Format: code in Courier at the margin, maths set (Word and PDF)', async () => {
+test('Manuscript Format: code in Courier at the indent, maths set (Word and PDF)', async () => {
   const D = `document.getElementById('manuscript-dialog')`;
   const to = saveTo('cm-ms.docx');
   await js(`(() => { window.__ms = doExport('manuscript'); })()`);
@@ -285,6 +317,10 @@ test('Manuscript Format: code in Courier at the margin, maths set (Word and PDF)
   const html = await js(`NeoManuscript.html(manuscriptModel(manuscriptDefaults(), manuscriptSections()))`);
   assert.match(html, /<p class="code"> {2}return s;<\/p>/);
   assert.match(html, /<math display="block"/);
+  assert.match(html, /<\/math><span class="mgap"><\/span>and more/);
+  assert.match(doc, /<\/m:oMathPara><\/w:p><w:p><w:pPr><w:pStyle w:val="Manuscript"\/>/);
+  const styles = await zip.file('word/styles.xml').async('string');
+  assert.match(styles.match(/<w:style [^>]*w:styleId="Code".*?<\/w:style>/)[0], /<w:ind w:left="720"\/>/);
 });
 
 test('Paperback pages: code lines marked for the space around them, maths set', async () => {
@@ -292,6 +328,7 @@ test('Paperback pages: code lines marked for the space around them, maths set', 
   assert.match(pb, /<p class="code top">const s/);
   assert.match(pb, /<p class="code end">x<\/p>/);
   assert.match(pb, /<math display="block"/);
+  assert.match(pb, /<\/math><span class="mgap"><\/span>and more/);
   assert.doesNotMatch(pb, /class="math"/);
 });
 

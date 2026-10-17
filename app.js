@@ -4138,7 +4138,10 @@ function mathMarkup(src, xml = false) {
 // Every span that lands on the page is set, however it got there: typed,
 // opened from a file, put back by ⌘Z.
 const MATH_SHEET = new CSSStyleSheet();
-MATH_SHEET.replaceSync(`math { font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; font-size: 1.1em; text-indent: 0; }
+MATH_SHEET.replaceSync(`.box { display: inline-block; width: 100%; text-align: center; text-indent: 0; margin: 0.45em 0; vertical-align: middle; }
+.gap { display: inline-block; width: 2em; }
+.gap[hidden], :host-context(p.flush) .gap, :host-context(p.poetry) .gap, :host-context(p[style*="text-align"]) .gap { display: none; }
+math { font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; font-size: 1.1em; text-indent: 0; }
 .raw { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.82em; white-space: pre-wrap; }`);
 function typesetMath(span) {
   const root = span.shadowRoot || span.attachShadow({ mode: 'open' });
@@ -4146,17 +4149,42 @@ function typesetMath(span) {
   if (root.tex === tex) return;
   root.tex = tex;
   root.adoptedStyleSheets = [MATH_SHEET];
-  root.innerHTML = mathMarkup(tex) || `<span class="raw">${escHtml(tex)}</span>`;
+  root.innerHTML = `<span class="box">${mathMarkup(tex) || `<span class="raw">${escHtml(tex)}</span>`}</span><span class="gap"></span>`;
+  mathGap(span);
 }
+// the gap that sets the words after a formula in at the indent opens only
+// when words follow it: at the end of a paragraph it would be a line of its own
+function mathGap(span) {
+  const gap = span.shadowRoot && span.shadowRoot.querySelector('.gap');
+  if (!gap) return;
+  let words = false;
+  for (let n = span.nextSibling; n && !words; n = n.nextSibling) {
+    if (n.nodeType === Node.TEXT_NODE) words = /\S/.test(n.data);
+    else if (n.nodeName === 'BR') break;
+    else words = !!n.textContent || (n.classList && n.classList.contains('fn'));
+  }
+  gap.hidden = !words;
+  // the space typed after the formula starts that line too: the gap gives
+  // its width back, so the first word sits on the indent exactly
+  let t = span.nextSibling;
+  while (t && t.nodeType === Node.TEXT_NODE && t.data === '') t = t.nextSibling;
+  const n = words && t && t.nodeType === Node.TEXT_NODE ? t.data.match(/^[ \t]*/)[0].length : 0;
+  let sp = 0;
+  if (n) { const r = document.createRange(); r.setStart(t, 0); r.setEnd(t, n); sp = r.getBoundingClientRect().width; }
+  gap.style.marginRight = sp ? `-${sp}px` : '';
+}
+const mathGapsIn = (p) => { if (p) for (const s of p.getElementsByClassName('math')) mathGap(s); };
 new MutationObserver((list) => {
   for (const m of list) {
+    if (m.type === 'characterData') { mathGapsIn(m.target.parentNode && m.target.parentNode.closest && m.target.parentNode.closest('p')); continue; }
     for (const n of m.addedNodes) {
       if (n.nodeType !== Node.ELEMENT_NODE) continue;
       if (n.classList.contains('math')) typesetMath(n);
       else if (n.firstElementChild) for (const s of n.getElementsByClassName('math')) typesetMath(s);
     }
+    if (m.target.nodeType === Node.ELEMENT_NODE) mathGapsIn(m.target.closest('p'));
   }
-}).observe(document.documentElement, { childList: true, subtree: true });
+}).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
 // the caret on the far side of an atom (a maths span, a footnote's number):
 // in the text that follows it, made if there's none, so typing goes there
 function caretPast(atom) {
@@ -16286,7 +16314,7 @@ function buildPrintHtml(d, o) {
   }
   body += back.map((x, i) => (i ? x.replace('class="backpage', 'class="backpage run-on') : x)).join('\n');
 
-  body = typesetMathHtml(body);
+  body = mathGaps(typesetMathHtml(body));
   const sz = trim.size;
   return `<!DOCTYPE html>
 <html lang="${esc(d.language || writingLanguage())}"><head><meta charset="utf-8"><title>${esc(d.title)}</title>
@@ -16355,10 +16383,12 @@ ${cap ? `p.first:not(.dialogue)::first-letter { initial-letter: 2; -webkit-initi
 p.brk { text-align: center; margin: 0.7em 0; break-after: avoid; letter-spacing: 0.1em; }
 p.poetry { margin: 0.5em 1.5em; text-align: left; }
 p.poetry + p.poetry { margin-top: 0; }
-p.code { font-family: "Courier Prime", "Courier New", monospace; font-size: 0.8em; line-height: 1.4; text-indent: 0; text-align: left; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; }
+p.code { font-family: "Courier Prime", "Courier New", monospace; font-size: 0.8em; line-height: 1.4; text-indent: 0; text-align: left; margin: 0 0 0 calc(1.5em / 0.8); white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; }
 p.code.top { margin-top: 0.7em; }
 p.code.end { margin-bottom: 0.7em; }
 math { display: block math; text-align: center; text-indent: 0; margin: 0.45em 0; font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; }
+.mgap { display: inline-block; width: 1.5em; }
+p.flush .mgap, p.poetry .mgap, p[style*="text-align"] .mgap { display: none; }
 .backpage p.hy { text-indent: 0; margin-bottom: 0.7em; }
 .also p { text-align: center; font-style: italic; margin: 0 0 0.45em; }
 .note .reach-hd { margin-top: 1.4em; text-align: center; letter-spacing: 0.18em; text-transform: uppercase; font-size: 0.85em; }
@@ -16767,7 +16797,7 @@ function buildHtml(data, opts = {}) {
     body += sectionHtml(ch);
   }
   if (!placed) body += contents;
-  body = typesetMathHtml(body);
+  body = mathGaps(typesetMathHtml(body));
   return `<!DOCTYPE html>
 <html lang="${escHtml(d.language || writingLanguage())}"><head><meta charset="utf-8"><title>${escHtml(d.title)}</title>
 <style>
@@ -16799,10 +16829,12 @@ function buildHtml(data, opts = {}) {
   .chapter .brk, .brk { text-align: center; text-indent: 0 !important; letter-spacing: 8px; color: #888; margin: 2.5em 0; }
   .chapter p.poetry { text-indent: 0; margin: 0 2.5em; }
   .chapter p.flush { text-indent: 0 !important; }
-  p.code { font-family: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.82em; line-height: 1.5; text-indent: 0 !important; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; }
+  p.code { font-family: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.82em; line-height: 1.5; text-indent: 0 !important; margin: 0 0 0 calc(2em / 0.82); white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; }
   p.code:not(p.code + p.code) { margin-top: 0.9em; }
   p.code:not(:has(+ p.code)) { margin-bottom: 0.9em; }
   math { display: block math; text-align: center; text-indent: 0; margin: 0.45em 0; font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; font-size: 1.1em; }
+  .mgap { display: inline-block; width: 2em; }
+  p.flush .mgap, p.poetry .mgap, p[style*="text-align"] .mgap { display: none; }
   .chapter p:not(.poetry) + p.poetry, .chapter .hd + p.poetry { margin-top: 0.9em; }
   .chapter p.poetry + p:not(.poetry) { margin-top: 0.9em; }
   .chapter p.byline { text-align: center; margin: -24px 0 40px; letter-spacing: 3px; text-transform: uppercase; font-size: 10pt; color: #555; }
@@ -16871,6 +16903,10 @@ const typesetMathHtml = (html) => html.replace(MATH_HTML, (all, tex) => {
   const src = tex.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
   return mathMarkup(src) || `<span class="math">${tex}</span>`;
 });
+// the words after a set formula carry on at the paragraph's indent: a gap
+// that wide opens their line (each format's CSS sizes .mgap, and hides it
+// where the paragraph has no indent); none where the paragraph ends
+const mathGaps = (html) => html.replace(/(<\/math>)[ \t]*(?![ \t\n]*(?:<\/p>|$))/g, '$1<span class="mgap"></span>');
 
 /* ---------- runs: paragraphs broken into styled text pieces ---------- */
 
@@ -17109,7 +17145,7 @@ function ommlOf(src) {
 }
 // A paragraph with maths in it, for Word: each formula an equation of its
 // own, centred, as on the page, and the words after it carry on below it
-// without an indent. para(runs, opts) sets the words; after(opts) is the
+// at the paragraph's indent. para(runs, opts) sets the words; after(opts) is the
 // paragraph that carries on; eq(omml) the equation's own paragraph.
 function docxMathSplit(runs, opts, para, after, eq) {
   if (!runs.some((r) => r.m)) return [para(runs, opts)];
@@ -17176,8 +17212,7 @@ function docxP(runs, opts = {}) {
 }
 
 // a paragraph of the book for Word, its formulas set as equations
-const docxMath = (runs, opts) => docxMathSplit(runs, opts, docxP,
-  (o) => (o.style === 'BodyText' ? { ...o, style: 'BodyTextNoIndent' } : o),
+const docxMath = (runs, opts) => docxMathSplit(runs, opts, docxP, (o) => o,
   (omml) => `<w:p><w:pPr><w:pStyle w:val="BodyTextNoIndent"/><w:jc w:val="center"/></w:pPr><m:oMathPara>${omml}</m:oMathPara></w:p>`);
 
 function buildDocxEntries(data) {
@@ -17280,7 +17315,7 @@ function docxEntriesOf(data) {
 ${para('BodyText', 'Body Text', '<w:ind w:firstLine="480"/>')}
 ${para('BodyTextNoIndent', 'Body Text No Indent', '', 'BodyText')}
 ${para('Poetry', 'Poetry', '<w:ind w:left="720" w:right="720"/>')}
-${para('Code', 'Code', '<w:spacing w:after="0" w:line="240" w:lineRule="auto"/>', 'Code', '<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="20"/>')}
+${para('Code', 'Code', '<w:spacing w:after="0" w:line="240" w:lineRule="auto"/><w:ind w:left="480"/>', 'Code', '<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="20"/>')}
 ${para('SceneBreak', 'Scene Break', '<w:spacing w:before="240"/><w:jc w:val="center"/>', 'BodyText')}
 ${para('Title', 'Title', '<w:spacing w:before="3000"/><w:jc w:val="center"/>', 'Normal', '<w:b/><w:sz w:val="56"/>')}
 ${para('Subtitle', 'Subtitle', '<w:jc w:val="center"/>', 'Normal', '<w:i/><w:sz w:val="32"/>')}
@@ -17344,7 +17379,7 @@ function chapterXhtml(ch, d) {
   // footnotes: the number is a link a reading app opens as a pop-up note
   let fnN = fnBefore(d, ch);
   const notes = [];
-  const xhtmlRuns = (p) => paraRuns(p.html).map((r) => {
+  const xhtmlRuns = (p) => mathGaps(paraRuns(p.html).map((r) => {
     if (r.br) return '<br/>';
     if (r.fn !== undefined) {
       notes.push(r.fn);
@@ -17358,7 +17393,7 @@ function chapterXhtml(ch, d) {
     if (r.i) t = '<em>' + t + '</em>';
     if (r.b) t = '<strong>' + t + '</strong>';
     return t;
-  }).join('');
+  }).join(''));
   // a page's lines, each set on its own
   const lines = () => ch.paras.map((p) => {
     if (p.sceneBreak) return '<p class="brk">* * *</p>';
@@ -17525,9 +17560,11 @@ p.right { text-align: right; text-indent: 0; }
 p.brk { text-align: center; text-indent: 0; margin: 2.5em 0; letter-spacing: 0.5em; }
 p.poetry { text-indent: 0; margin: 0 2em; }
 p.flush { text-indent: 0 !important; }
-p.code { font-family: monospace; font-size: 0.85em; text-indent: 0 !important; text-align: left; margin: 0; white-space: pre-wrap; -webkit-hyphens: none; -epub-hyphens: none; hyphens: none; }
+p.code { font-family: monospace, monospace; font-size: 0.85em; text-indent: 0 !important; text-align: left; margin: 0 0 0 calc(1.2em / 0.85); white-space: pre-wrap; -webkit-hyphens: none; -epub-hyphens: none; hyphens: none; }
 math { display: block; text-align: center; text-indent: 0; margin: 0.45em 0; font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; }
 code.math { font-family: monospace; font-size: 0.9em; }
+.mgap { display: inline-block; width: 1.2em; }
+p.flush .mgap, p.poetry .mgap, p.center .mgap, p.right .mgap { display: none; }
 :not(.code) + p.code, p.code + :not(.code) { margin-top: 0.9em; }
 p:not(.poetry) + p.poetry, h1 + p.poetry { margin-top: 0.9em; }
 p.poetry + p:not(.poetry) { margin-top: 0.9em; }

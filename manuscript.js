@@ -104,7 +104,7 @@
   const plainRun = (text) => [{ text }];
   // A paragraph with maths in it (a run with omml, the formula as a Word
   // equation): each formula centred on a line of its own, as on the page,
-  // the words after it carrying on below without an indent
+  // the words after it carrying on below at the paragraph's indent
   function withMaths(runs, o) {
     if (!(runs || []).some((r) => r.omml)) return [p(runs, o)];
     const out = [];
@@ -120,7 +120,7 @@
       if (!r.omml) { words.push(r); continue; }
       flush();
       out.push(`<w:p><w:pPr><w:pStyle w:val="ManuscriptNoIndent"/>${opts.pageBreak ? '<w:pageBreakBefore/>' : ''}<w:jc w:val="center"/></w:pPr><m:oMathPara>${r.omml}</m:oMathPara></w:p>`);
-      opts = { ...o, pageBreak: false, style: o.style === 'Manuscript' ? 'ManuscriptNoIndent' : o.style };
+      opts = { ...o, pageBreak: false };
     }
     flush();
     return out;
@@ -219,7 +219,7 @@
 <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style>
 ${para('Manuscript', 'Manuscript Text', `<w:ind w:firstLine="${TWIP / 2}"/>`)}
 ${para('ManuscriptNoIndent', 'Manuscript Text No Indent', '')}
-${para('Code', 'Code', '', '<w:rFonts w:ascii="Courier New" w:hAnsi="Courier New" w:cs="Courier New"/>')}
+${para('Code', 'Code', `<w:ind w:left="${TWIP / 2}"/>`, '<w:rFonts w:ascii="Courier New" w:hAnsi="Courier New" w:cs="Courier New"/>')}
 ${para('Poetry', 'Poetry', `<w:ind w:left="${TWIP / 2}" w:right="${TWIP / 2}"/>`)}
 ${para('Centered', 'Centered', '<w:jc w:val="center"/>')}
 ${para('SceneBreak', 'Scene Break', '<w:jc w:val="center"/>')}
@@ -309,12 +309,14 @@ ${headers.map((h) => `<Relationship Id="${h.id}" Type="http://schemas.openxmlfor
   // counter gave every note on a page that page's last number)
   let fnCount = 0;
   function runsHtml(runs) {
-    return (runs || []).map((r) => {
+    return (runs || []).map((r, i) => {
       if (r.br) return '<br>';
       // a footnote: Paged.js sets it at the foot of its page
       if (r.fn !== undefined) { fnCount += 1; return `<sup class="fncall">${fnCount}</sup><span class="footnote">${fnCount}. ${escHtml(r.fn)}</span>`; }
-      // a formula, set (MathML), centred on a line of its own
-      if (r.mathml) return r.mathml;
+      // a formula, set (MathML), centred on a line of its own, the words
+      // after it opening their line at the indent (.mgap)
+      if (r.mathml) return r.mathml + (runs.slice(i + 1).some((q) => (q.text && q.text.trim()) || q.fn !== undefined) ? '<span class="mgap"></span>' : '');
+      if (i && runs[i - 1].mathml && r.text) r = { ...r, text: r.text.replace(/^[ \t]+/, '') };
       let t = escHtml(r.text);
       if (r.s) t = '<s>' + t + '</s>';
       if (r.u) t = '<u>' + t + '</u>';
@@ -375,8 +377,10 @@ p.flush, p.c, p.r, p.brk, p.end, p.poetry { text-indent: 0; }
 p.c, p.brk, p.end { text-align: center; }
 p.r { text-align: right; }
 p.poetry { margin: 0 0.5in; }
-p.code { text-indent: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: "Courier Prime", "Courier New", Cousine, "Liberation Mono", Courier, monospace; }
+p.code { text-indent: 0; margin-left: 0.5in; white-space: pre-wrap; overflow-wrap: anywhere; font-family: "Courier Prime", "Courier New", Cousine, "Liberation Mono", Courier, monospace; }
 math { display: block math; text-align: center; text-indent: 0; font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; }
+.mgap { display: inline-block; width: 0.5in; }
+p.flush .mgap, p.c .mgap, p.r .mgap, p.poetry .mgap { display: none; }
 p.end { margin-top: 2em; }
 section.newpage { break-before: page; }
 h2 { font: inherit; font-weight: normal; text-align: center; margin: calc(${pp.in[1] / 3 - 1}in) 0 2em; break-after: avoid; }
