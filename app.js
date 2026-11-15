@@ -198,6 +198,15 @@ let book = null;             // current book.json
 let chapterHTML = {};        // chapterId -> html (loaded at open)
 let savedHTML = {};          // chapterId -> html as last read from / written to disk
 let savedMetaSig = '';       // book.json as last read/written, minus the volatile bits
+// Two devices on one library. Every chapter this window holds or has held for
+// the open book: one book.json lists that isn't here was added on another
+// device, and is taken in before book.json is written (saveMeta). And the
+// order book.json held when this window last saved or took it: a chapter gone
+// from it since was taken out here, on purpose, and is named in
+// book.removedChapters so the other device lets it go too, where a chapter
+// its book.json merely never heard of is kept.
+let knownChapters = new Set();
+let savedOrder = [];
 let diskStamps = {};         // chapterId -> file mtime as of the last look at the disk
 let writing = {};            // chapterId -> chapter writes still on their way to disk
 let stickies = [];           // [{id, chapterId, text, resolved}]
@@ -762,6 +771,15 @@ async function loadLibrary() {
 function showFirstRun() {
   const fr = $('#firstrun');
   fr.hidden = false;
+  // a Mac where NEO Pocket already keeps books in iCloud Drive: open those
+  // instead of starting a new library (NEO restarts in that folder)
+  if (window.neo.pocketLibrary) {
+    window.neo.pocketLibrary().then((p) => {
+      if (!p || !p.offer) return;
+      $('#fr-pocket').hidden = false;
+      $('#fr-pocket-btn').onclick = () => { window.neo.usePocketLibrary(); };
+    }).catch(() => {});
+  }
   let picked = { body: Object.keys(BODY_FONTS)[0] || 'Georgia', dropcap: 'literary' };
 
   // Step 1: who are you, and how do you write?
@@ -883,9 +901,9 @@ async function shelfMeta(bookId) {
 // Saves a book's meta and drops the cached copy. This used to be done by
 // replacing window.neo.writeBookMeta, but on desktop that object is
 // read-only, so the assignment threw and app.js stopped loading.
-function writeBookMeta(bookId, meta) {
+function writeBookMeta(bookId, meta, known) {
   bookMetaCache.delete(bookId);
-  return window.neo.writeBookMeta(bookId, meta);
+  return window.neo.writeBookMeta(bookId, meta, known);
 }
 
 async function renderShelves() {
@@ -1132,11 +1150,12 @@ async function renderShelves() {
     blank.title = t('Start a new book');
     blank.onclick = () => createBookOnShelf(shelf);
     pressable(blank, t('Start a new book'));
-    // right-click (a long press on a phone): a book or a script
+    // right-click (a long press on a phone): a book or a script — in simple
+    // NEO and on Pocket too, so a writer who looks for scripts finds them
+    // where they'd look (#494, #504)
     if (!isBound(shelf)) {
       blank.addEventListener('contextmenu', async (e) => {
         e.preventDefault();
-        if (!moreOn()) return; // scripts are behind Show More Features
         const pick = await popMenu(e.clientX, e.clientY, [
           { label: t('New Book'), value: 'book' },
           { label: t('New Script'), value: 'script' }
@@ -2501,7 +2520,6 @@ $('#author-chip').onclick = async () => {
 
 let openGeneration = 0;
 async function openBook(bookId) {
-  diskWordsAt = Date.now();
   // a book being exported from the shelf finishes first (it borrows the
   // open book's place for the moment it takes)
   while (shelfExport) await new Promise((r) => setTimeout(r, 50));
@@ -2522,8 +2540,8 @@ async function openBook(bookId) {
   tabPlaces = {}; // a fresh book starts with fresh places
   book = meta;
   showWindowTitle();
-  snapShown = null;
-  snapCache = null;
+  forgetSnapshots();
+  forgetSpelling();
   sideCardsKey = '';
   currentChapterId = null; // never carry a chapter reference across books
   undoStack = []; redoStack = [];
@@ -2532,6 +2550,8 @@ async function openBook(bookId) {
   for (const chId of Object.keys(html)) knowDisk(bookId, chId, html[chId]);
   diskStamps = {};
   savedMetaSig = metaSig(book); // what disk holds; NEO's own defaults don't count as edits
+  knownChapters = new Set(book.chapterOrder);
+  savedOrder = [...book.chapterOrder];
   stickies = sideStickies;
   darlings = sideDarlings;
   sidecarBase[bookId + '/stickies'] = JSON.stringify(stickies);
@@ -2551,6 +2571,7 @@ async function openBook(bookId) {
   spEditorMode(); // a script, or a book
 
   renderChapters();
+  wordsFromDisk(); // what the book holds is not today's writing (#345)
   renderStickies();
   migrateDarlingAnchors(); // sweep legacy invisible markers out of the prose
   reconcileMarks();        // re-adopt any note marks orphaned by cut/paste
@@ -2680,6 +2701,18 @@ function renderChapters() {
     // a script's lines are set as they print (styles.css, SCREENPLAYS)
     if (isScript()) body.classList.add('script-body', $('#paper').classList.contains('narrow') ? 'sp-narrow' : 'sp-geom', 'no-cap');
     body.innerHTML = chapterHTML[chId] || '<p><br></p>';
+    // a script saved with its last line element deleted comes back from disk
+    // as bare text with no lines at all — Return and Tab do nothing on it and
+    // every restart keeps it that way. Wrap the stray text into one line
+    // again, as a heading when it reads like one (INT./EXT.), else as action,
+    // the way the same typing is set in a script that works
+    if (isScript() && !body.querySelector('p') && body.textContent.trim()) {
+      const line = document.createElement('p');
+      line.innerHTML = body.innerHTML;
+      body.innerHTML = '';
+      body.appendChild(line);
+      if (SP_HEAD_RE.test(line.textContent)) line.classList.add('sp-heading');
+    }
     markDialogueOpening(body);
     if (PAGE_PROMPTS[kind]) {
       body.dataset.ph = PAGE_PROMPTS[kind]();
@@ -2810,6 +2843,9 @@ async function chapterMenu(chId, x = 0, y = 0, from = null) {
   }
   snapshotStructure('chapter kind');
   setChapterKind(chId, choice);
+  // a part or a page leaves the story's count, and a chapter coming back
+  // joins it again: no word was written or cut, so today doesn't move (#436)
+  wordsFromDisk();
   // a copyright page starts with what every copyright page says
   if (choice === 'copyright' && !chapterText(chId).trim()) {
     chapterHTML[chId] = copyrightStarter();
@@ -2844,6 +2880,21 @@ document.addEventListener('drop', () => { setTimeout(() => { dragFromInside = fa
 let lastRealKeyAt = 0;
 if (IS_POCKET) document.addEventListener('keydown', (e) => { if (e.keyCode !== 229 && e.key !== 'Unidentified') lastRealKeyAt = Date.now(); }, true);
 
+// ---- typing style rules: what ⌘B, ⌘I, ⌘U and ⌘⇧S leave at the caret (#430) ----
+// Turned on or off with nothing selected, they style only the letters typed
+// next, and the engine forgets that as soon as the selection is set again,
+// even to the same place. move sets it; whatever it undid is turned back,
+// and the commands that had to be run again are returned.
+const TYPING_STYLES = ['bold', 'italic', 'underline', 'strikeThrough'];
+function keepTypingStyle(doc, move) {
+  const was = TYPING_STYLES.map((cmd) => doc.queryCommandState(cmd));
+  move();
+  const back = TYPING_STYLES.filter((cmd, i) => doc.queryCommandState(cmd) !== was[i]);
+  for (const cmd of back) doc.execCommand(cmd);
+  return back;
+}
+// ---- end of typing style rules ----
+
 function wireChapterBody(body, chId) {
   body.addEventListener('focus', () => { currentChapterId = chId; updateCounters(); highlightNav(); });
 
@@ -2858,7 +2909,11 @@ function wireChapterBody(body, chId) {
       if (composing || document.activeElement !== body) return;
       const sel = window.getSelection();
       if (!sel.rangeCount || !sel.isCollapsed || !body.contains(sel.anchorNode)) return;
-      sel.collapse(sel.anchorNode, sel.anchorOffset);
+      // setting the caret again also drops what ⌘I or ⌘B just turned on or
+      // off for the next letters, so they come back with it (#430)
+      const sc = $('#paper-scroll');
+      const keep = sc.scrollTop;
+      if (keepTypingStyle(document, () => sel.collapse(sel.anchorNode, sel.anchorOffset)).length) sc.scrollTop = keep;
     }, 1000);
   };
   body.addEventListener('input', () => {
@@ -2980,15 +3035,6 @@ function wireChapterBody(body, chId) {
       structuralUndo();
       return;
     }
-    // Chromium's selection-delete can duplicate a neighboring character when
-    // the selection spans fragmented text nodes. Merging the fragments right
-    // before any destructive keystroke.
-    if (!e.metaKey && !e.ctrlKey && !e.altKey) {
-      const s = window.getSelection();
-      const destructive = e.key === 'Backspace' || e.key === 'Delete' ||
-        (s && !s.isCollapsed && (e.key.length === 1 || e.key === 'Enter'));
-      if (destructive) healSelectionSeams(body);
-    }
     if (styleKeepScroll(e)) return;
     // a script: its own Enter, Tab and ⌘1–7; no breaks, poetry or chapters
     if (isScript()) {
@@ -3016,10 +3062,6 @@ function wireChapterBody(body, chId) {
     if (handleEnter(e, body, chId)) return;
     if (handleTabSpacing(e)) return;
     smartKeys(e, body);
-  });
-  // when the whole chapter loses focus, merge every fragmented text node
-  body.addEventListener('blur', () => {
-    try { body.normalize(); } catch { /* nothing to merge */ }
   });
   body.addEventListener('mousedown', () => { enterRun = 0; });
   body.addEventListener('click', (e) => {
@@ -3572,22 +3614,6 @@ function spaceSafeDelete(e, body, chId) {
   return true;
 }
 
-// Merge fragmented text nodes in the paragraph(s) the selection touches,
-// so native editing operates on whole text instead of seams.
-function healSelectionSeams(body) {
-  const sel = window.getSelection();
-  if (!sel.rangeCount) return;
-  const r = sel.getRangeAt(0);
-  const paraOf = (n) => {
-    if (n && n.nodeType === Node.TEXT_NODE) n = n.parentElement;
-    return n && n.closest ? n.closest('p') : null;
-  };
-  const a = paraOf(r.startContainer);
-  const b = paraOf(r.endContainer);
-  try { if (a && body.contains(a)) a.normalize(); } catch { /* fine */ }
-  try { if (b && b !== a && body.contains(b)) b.normalize(); } catch { /* fine */ }
-}
-
 // Chromium mangles Backspace/Delete beside non-editable inline elements:
 function guardMarkerDelete(e, body, chId) {
   if (e.key !== 'Backspace' && e.key !== 'Delete') return false;
@@ -3714,6 +3740,7 @@ function splitChapterAt(body, chId, block, sel, was) {
     block = next;
   }
   while (blank(block.previousElementSibling) && block.previousElementSibling.previousElementSibling) block.previousElementSibling.remove();
+  const settle = holdDay();
   const parts = [];
   let n = block;
   while (n) {
@@ -3729,6 +3756,7 @@ function splitChapterAt(body, chId, block, sel, was) {
   chapterHTML[newId] = parts.join('') || '<p><br></p>';
   persistChapter(newId);
   renderChapters();
+  settle();
   focusChapterStart(newId);
   resetNativeUndo();
   // the writer's line stays where it was in the window, the new chapter's
@@ -3874,10 +3902,15 @@ function handleEnter(e, body, chId) {
   if (prev) {
     e.preventDefault();
     snapshotStructure('section break', { rejoin: enterRun >= 2 });
-    block.removeAttribute('style'); // (see above: a break carries nothing over)
+    // the line under the break is set as the one it was made in, the way
+    // Enter carries a paragraph's alignment (a third Enter takes it on into
+    // the next chapter); the break itself carries nothing (see above)
+    const align = block.style.textAlign;
+    block.removeAttribute('style');
     block.className = 'scene-break';
     block.textContent = '***';
     const np = document.createElement('p');
+    if (align) np.style.textAlign = align;
     np.innerHTML = '<br>';
     block.after(np);
     const range = document.createRange();
@@ -4139,7 +4172,7 @@ function mathMarkup(src, xml = false) {
 // opened from a file, put back by ⌘Z.
 const MATH_SHEET = new CSSStyleSheet();
 MATH_SHEET.replaceSync(`.box { display: inline-block; width: 100%; text-align: center; text-indent: 0; margin: 0.45em 0; vertical-align: middle; }
-.gap { display: inline-block; width: 2em; }
+.gap { display: inline-block; width: 2em; text-indent: 0; }
 .gap.cap { width: auto; height: 0; overflow: hidden; visibility: hidden; vertical-align: baseline; font-size: 3.4em; line-height: 0.8; padding-right: 8px; font-family: var(--dropcap-font); }
 .gap.cap::before { content: attr(data-cap); }
 .gap[hidden], :host-context(p.flush) .gap, :host-context(p.poetry) .gap, :host-context(p[style*="text-align"]) .gap { display: none; }
@@ -4154,9 +4187,9 @@ function typesetMath(span) {
   root.innerHTML = `<span class="box">${mathMarkup(tex) || `<span class="raw">${escHtml(tex)}</span>`}</span><span class="gap"></span>`;
   mathGap(span);
 }
-// the paragraphs the drop cap is set in (the ::first-letter rule in styles.css)
-const CAP_P = 'body:not(.no-dropcap) .chapter-body:not(.cap-off):not(.no-cap):not(.opens-dialogue) p[data-first]';
-// the letters ::first-letter takes: any punctuation in front, then the letter
+// the paragraphs the drop cap is set in (the ::before rule in styles.css)
+const CAP_P = 'body:not(.no-dropcap) .chapter-body.has-cap:not(.no-cap):not(.opens-dialogue) p[data-first]';
+// the letters the drop cap takes: any punctuation in front, then the letter
 const capLetter = (text) => ((text || '').match(/^\s*([\p{P}]*[^\s\p{P}])/u) || [])[1] || '';
 // the gap that sets the words after a formula in at the indent opens only
 // when words follow it: at the end of a paragraph it would be a line of its
@@ -4677,6 +4710,13 @@ function openingPara(body) {
   return ps.find((p) => p.textContent.trim() !== '') || ps[0] || null;
 }
 function markDialogueOpening(body) {
+  // the engine, joining or emptying paragraphs, writes the indent a paragraph
+  // had at that moment onto it for good (the opening one's most of all). The
+  // indent is the stylesheet's to give; an alignment the writer chose stays.
+  for (const p of body.querySelectorAll(':scope > p[style*="text-indent"]')) {
+    p.style.removeProperty('text-indent');
+    if (!p.getAttribute('style')) p.removeAttribute('style');
+  }
   const first = openingPara(body);
   for (const p of body.querySelectorAll('p[data-first]')) if (p !== first) p.removeAttribute('data-first');
   if (first && !first.hasAttribute('data-first')) first.setAttribute('data-first', '');
@@ -4686,7 +4726,194 @@ function markDialogueOpening(body) {
     const speech = OPENING_DASH.test(p.textContent);
     if (p.hasAttribute('data-speech') !== speech) p.toggleAttribute('data-speech', speech);
   }
+  setDropCap(body, first);
 }
+
+// THE DROP CAP is a letter NEO draws beside the opening paragraph (that
+// paragraph's ::before, its letter and width handed over in --cap and --cap-w
+// on the chapter body, which is never saved). It is not a ::first-letter:
+// that makes the engine split the paragraph's text in two behind the scenes,
+// and typing or deleting beside the split left doubled letters on the page,
+// so for a long time the cap had to step aside whenever the caret was in its
+// paragraph. Now the words are one plain run of text to edit. The real first
+// letter is still there, unseen (the neo-cap highlight paints it clear) and
+// drawn back under the cap by its own width, so the line starts where it
+// always did.
+const capHidden = window.Highlight && window.CSS && CSS.highlights ? new Highlight() : null;
+if (capHidden) {
+  capHidden.priority = 50; // over the focus, search and spelling highlights: none of them may ink it in
+  CSS.highlights.set('neo-cap', capHidden);
+}
+const capState = new WeakMap(); // chapter body → { range, cap, sig }
+const capWidths = new Map(); // what a letter measures, in em, when its chapter isn't laid out
+const CAP_LEAD = /^[\p{Ps}\p{Pi}\p{Pf}\p{Pe}\p{Po}]*/u; // an opening quote or ¿ is set with its letter
+const capSegmenter = window.Intl && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
+
+// The letter (with any mark that opens it) a paragraph's text begins with;
+// '' when it begins with a space or with nothing a cap can be made of
+function capOf(text) {
+  const lead = CAP_LEAD.exec(text)[0];
+  const rest = text.slice(lead.length);
+  if (!rest) return '';
+  const g = capSegmenter ? capSegmenter.segment(rest)[Symbol.iterator]().next().value.segment : String.fromCodePoint(rest.codePointAt(0));
+  return /[\p{L}\p{N}]/u.test(g) ? lead + g : '';
+}
+
+// Where the paragraph's words begin: its first text nodes, in order. A flag
+// or a footnote number standing before the first word means no cap.
+function capOpening(p) {
+  const nodes = [];
+  let text = '';
+  const walker = document.createTreeWalker(p, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) => (n.nodeType === Node.ELEMENT_NODE && n.matches(UNCOUNTED) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT)
+  });
+  // (a rejected element's subtree is skipped; one that takes up room ends the search)
+  for (let n = p.firstChild; n; n = n.nextSibling) {
+    if (n.nodeType === Node.ELEMENT_NODE && n.matches('.ph-mark, .fn')) return null;
+    if (n.nodeType !== Node.ELEMENT_NODE || !n.matches(UNCOUNTED)) break;
+  }
+  let n;
+  while (text.length < 16 && (n = walker.nextNode())) {
+    // a line break before the first word: the letter isn't on the first line to be tucked away
+    if (n.nodeName === 'BR' && !text) return null;
+    if (n.nodeType !== Node.TEXT_NODE || !n.data) continue;
+    nodes.push(n);
+    text += n.data;
+  }
+  return nodes.length ? { nodes, text } : null;
+}
+
+function clearDropCap(body) {
+  const st = capState.get(body);
+  if (!st) return;
+  if (capHidden) capHidden.delete(st.range);
+  capState.delete(body);
+  body.classList.remove('has-cap');
+  body.style.removeProperty('--cap');
+  body.style.removeProperty('--cap-w');
+  if (!body.getAttribute('style')) body.removeAttribute('style');
+}
+
+// `remeasure`: the type changed (a font chosen, or one that just arrived)
+function setDropCap(body, first, remeasure = false) {
+  const open = capHidden && first && !body.classList.contains('no-cap') && !body.classList.contains('opens-dialogue') &&
+    !document.body.classList.contains('no-dropcap') && capOpening(first);
+  const cap = open ? capOf(open.text) : '';
+  if (!cap) { clearDropCap(body); return; }
+  // the cap's own letters, from the paragraph's first character on
+  let left = cap.length;
+  let end = open.nodes[0];
+  let endAt = 0;
+  for (const n of open.nodes) {
+    end = n;
+    endAt = Math.min(left, n.data.length);
+    left -= endAt;
+    if (!left) break;
+  }
+  // how the letter is set where it stands (in an italic, say) decides its width
+  // (and the letter after it: a pair like "To" is set closer than "Th")
+  let sig = cap + '~' + open.text.slice(cap.length, cap.length + 2);
+  for (const n of open.nodes) {
+    // (the engine's own spans carry their weight and slant in a style)
+    for (let el = n.parentElement; el && el !== first; el = el.parentElement) sig += '>' + el.tagName + (el.getAttribute('style') || '');
+    if (n === end) break;
+    sig += '|';
+  }
+  let st = capState.get(body);
+  if (!st) {
+    st = { range: document.createRange(), cap: '', sig: '' };
+    capState.set(body, st);
+    if (capHidden.size > 400) for (const r of [...capHidden]) if (!r.startContainer.isConnected) capHidden.delete(r); // chapters since redrawn
+  }
+  const r = st.range;
+  if (r.startContainer !== open.nodes[0] || r.startOffset !== 0 || r.endContainer !== end || r.endOffset !== endAt) {
+    r.setStart(open.nodes[0], 0);
+    r.setEnd(end, endAt);
+  }
+  if (!capHidden.has(r)) capHidden.add(r);
+  if (st.cap !== cap) body.style.setProperty('--cap', JSON.stringify(cap));
+  if (!body.classList.contains('has-cap')) body.classList.add('has-cap');
+  if (st.sig !== sig || remeasure) {
+    const host = open.nodes[0].parentElement;
+    const cs = getComputedStyle(host);
+    const size = parseFloat(cs.fontSize) || 17;
+    // as laid out on the page; from the font's own figures while the chapter isn't on screen
+    let w = r.getBoundingClientRect().width / size;
+    if (!w) {
+      const font = `${cs.fontStyle} ${cs.fontWeight} ${size}px ${cs.fontFamily}`;
+      const key = font + '|' + cap;
+      if (remeasure || !capWidths.has(key)) {
+        const ctx = (setDropCap.canvas || (setDropCap.canvas = document.createElement('canvas'))).getContext('2d');
+        ctx.font = font;
+        capWidths.set(key, ctx.measureText(cap).width / size);
+      }
+      w = capWidths.get(key);
+      sig = ''; // measured for real the next time it's looked at
+    }
+    body.style.setProperty('--cap-w', w.toFixed(4) + 'em');
+  }
+  st.cap = cap;
+  st.sig = sig;
+  queueCapCheck(body);
+}
+
+// The letter's width also turns on things no key above can name: whether the
+// engine has just joined two runs of text, so that "AT" is now set as a pair.
+// So once the page has settled after an edit the width is read again, as laid
+// out, and put right if it's off (a pixel, when it is).
+const capChecks = new Set();
+let capCheckFrame = 0;
+function queueCapCheck(body) {
+  capChecks.add(body);
+  if (capCheckFrame) return;
+  capCheckFrame = requestAnimationFrame(() => {
+    capCheckFrame = 0;
+    const bodies = [...capChecks];
+    capChecks.clear();
+    const found = [];
+    for (const body of bodies) {
+      const st = capState.get(body);
+      if (!st || !body.isConnected || !st.range.startContainer.isConnected) continue;
+      const w = st.range.getBoundingClientRect().width;
+      const size = w && parseFloat(getComputedStyle(st.range.startContainer.parentElement).fontSize);
+      if (w && size) found.push([body, (w / size).toFixed(4) + 'em']);
+    }
+    for (const [body, em] of found) if (body.style.getPropertyValue('--cap-w') !== em) body.style.setProperty('--cap-w', em);
+  });
+}
+
+// every chapter's cap, looked at again (the cap turned on or off, a new font)
+function refreshDropCaps(remeasure = false) {
+  for (const body of document.querySelectorAll('#chapters .chapter-body')) {
+    const first = body.querySelector(':scope > p[data-first]');
+    if (first) setDropCap(body, first, remeasure); else clearDropCap(body);
+  }
+}
+if (document.fonts) document.fonts.addEventListener('loadingdone', () => refreshDropCaps(true));
+// Words copied, cut or dragged out to another program take the paragraph's
+// look with them, and the opening paragraph's would carry the little pull
+// back that tucks its letter under the cap: in Word or an email, a first
+// line hanging out to the left. For the moment the copy is made, that
+// paragraph is set flush (nothing is drawn in between).
+for (const type of ['copy', 'cut', 'dragstart']) {
+  document.addEventListener(type, () => {
+    document.body.classList.add('cap-copying');
+    setTimeout(() => document.body.classList.remove('cap-copying'), 0);
+  }, true);
+}
+// In focus mode selected text is given its full ink back, and the unseen
+// letter with it. While a selection takes that letter in, the cap stands on a
+// patch of the page's own colour, over it (cap-sel, styles.css).
+document.addEventListener('selectionchange', () => {
+  const sel = window.getSelection();
+  const r = focusLevel !== 'off' && sel && sel.rangeCount && !sel.isCollapsed ? sel.getRangeAt(0) : null;
+  if (!r && !document.querySelector('#chapters .chapter-body.cap-sel')) return;
+  for (const body of document.querySelectorAll('#chapters .chapter-body.has-cap, #chapters .chapter-body.cap-sel')) {
+    const st = capState.get(body);
+    const over = !!(r && st && st.range.startContainer.isConnected && r.isPointInRange(st.range.startContainer, 0));
+    if (body.classList.contains('cap-sel') !== over) body.classList.toggle('cap-sel', over);
+  }
+});
 
 function syncChapter(body, chId) {
   markDialogueOpening(body);
@@ -4697,9 +4924,11 @@ function syncChapter(body, chId) {
   scheduleNavRefresh();
 }
 
-// Heal text-node fragmentation in each paragraph as the caret leaves it:
-let lastCaretPara = null;
-let capOffBody = null;
+// Text nodes are never merged behind the engine's back (by normalize()):
+// its undo history points at the nodes, so ⌘Z after a cut footnote put the
+// words back without the number once the caret had moved on (#477). The
+// character duplication those merges were for (0.3.7): Electron 43 has no
+// such issue.
 let menuPoetryState = false;
 let menuFlushState = false;
 document.addEventListener('selectionchange', () => {
@@ -4711,12 +4940,6 @@ document.addEventListener('selectionchange', () => {
     if (el && el.nodeType === Node.TEXT_NODE) el = el.parentElement;
     const p = el && el.closest ? el.closest('p') : null;
     if (p && p.parentElement && p.parentElement.classList.contains('chapter-body')) caretP = p;
-  }
-  if (caretP !== lastCaretPara) {
-    if (lastCaretPara && lastCaretPara.isConnected) {
-      try { lastCaretPara.normalize(); } catch { /* fine */ }
-    }
-    lastCaretPara = caretP;
   }
   // a script: the element in the pane, the suggestion at the caret
   if (isScript()) {
@@ -4730,7 +4953,6 @@ document.addEventListener('selectionchange', () => {
     const ch = caretP.closest('.chapter');
     if (ch) scanSpellingIn(ch.querySelector('.chapter-body'), ch.dataset.id);
   }
-  // the drop cap steps aside while the caret is in the first paragraph
   const inPoetry = !!(caretP && caretP.classList.contains('poetry'));
   if (inPoetry !== menuPoetryState && window.neo.poetryState) {
     menuPoetryState = inPoetry;
@@ -4740,14 +4962,6 @@ document.addEventListener('selectionchange', () => {
   if (inFlush !== menuFlushState && window.neo.flushState) {
     menuFlushState = inFlush;
     window.neo.flushState(inFlush);
-  }
-  const inFirst = caretP && caretP.parentElement &&
-    caretP.hasAttribute('data-first');
-  const capBody = inFirst ? caretP.parentElement : null;
-  if (capBody !== capOffBody) {
-    if (capOffBody && capOffBody.isConnected) capOffBody.classList.remove('cap-off');
-    if (capBody) capBody.classList.add('cap-off');
-    capOffBody = capBody;
   }
 });
 
@@ -5010,6 +5224,7 @@ document.addEventListener('keydown', (e) => {
 let dashJustSet = null; // the dash just set, for ⌘Z
 function dialogueDashKey(e, body) {
   if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || e.isComposing || e.keyCode === 229) return;
+  if (body.classList.contains('script-body')) return; // a script keeps the hyphens it is typed with (#460)
   const key = e.key === 'Enter' ? '' : e.key;
   if (key.length > 1) return;
   const sel = window.getSelection();
@@ -5145,19 +5360,22 @@ function smartKeys(e, body) {
   if (markdownMath(e, body, range)) return;
   if (markdownEmphasis(e, body, range)) return;
   // German sets its dash as an en dash – like this –, so there -- makes
-  // one, and a third hyphen the em dash (#286)
+  // one, and a third hyphen the em dash (#286). A script keeps -- and ...
+  // as typed: that is how a screenplay writes a dash and a trailing off
+  // (and how Final Draft and Fountain read them, #460)
   const german = writingLanguage().toLowerCase().startsWith('de');
-  if (e.key === '-' && prevChars(1) === '-') {
+  const script = body.classList.contains('script-body');
+  if (!script && e.key === '-' && prevChars(1) === '-') {
     e.preventDefault();
     replaceBefore(1, german ? '–' : '—');
     return;
   }
-  if (german && e.key === '-' && prevChars(1) === '–') {
+  if (!script && german && e.key === '-' && prevChars(1) === '–') {
     e.preventDefault();
     replaceBefore(1, '—');
     return;
   }
-  if (e.key === '.' && prevChars(2) === '..') {
+  if (!script && e.key === '.' && prevChars(2) === '..') {
     e.preventDefault();
     replaceBefore(2, '…'); // …
     return;
@@ -5176,26 +5394,9 @@ function smartKeys(e, body) {
   }
   if (e.key === '"' || e.key === "'") {
     e.preventDefault();
-    const before = prevChars(1);
-    const q = e.key === '"' ? bookQuotes(body) : quoteStyle();
-    let opening = before === '' || /[\s\(\[\{‘“«„‚»›‹>]/.test(before);
-    // after a dash, a quote usually closes speech that was cut off ("I was
-    // just—"); it opens one only when no quotation is open in the paragraph
-    if (before === '—' || before === '–') opening = !quoteIsOpen(range, e.key === '"' ? q : { open: '‘', close: '’' }, e.key === '"' ? '"' : '');
-    let ch;
-    if (e.key === "'") {
-      // most languages type ' as an apostrophe only; English, Dutch and
-      // German also open (and German closes) single quotes with it
-      const sq = singleQuotes(body);
-      if (!sq) ch = '’';
-      else if (opening) ch = sq.open;
-      // German's closing mark isn't its apostrophe: it closes only a single
-      // quotation that is open in the paragraph
-      else if (sq.close !== '’' && quoteIsOpen(range, sq, '')) ch = sq.close;
-      else ch = '’';
-    } else {
-      ch = opening ? q.open : q.close;
-    }
+    const double = e.key === '"';
+    const ch = typedQuote(e.key, prevChars(8), double ? bookQuotes(body) : null, double ? null : singleQuotes(body),
+      (q, straight) => quoteIsOpen(range, q, straight));
     document.execCommand('insertText', false, ch);
   }
 }
@@ -5232,6 +5433,40 @@ function quoteOpenIn(text, q, straight = '') {
   return depth > 0 || straights % 2 === 1;
 }
 
+// What a typed " or ' becomes. before: the text just before the caret (in
+// its text node); q: the double marks, sq: the single ones (null where '
+// is only an apostrophe); isOpen(marks, straight): is a quotation in those
+// marks open in the paragraph so far (quoteIsOpen).
+function typedQuote(key, before, q, sq, isOpen) {
+  const last = before.slice(-1);
+  let opening = quoteOpensAfter(before);
+  // after a dash, a quote usually closes speech that was cut off ("I was
+  // just—"); it opens one only when no quotation is open in the paragraph
+  if (last === '—' || last === '–') opening = !isOpen(key === '"' ? q : { open: '‘', close: '’' }, key === '"' ? '"' : '');
+  if (key === '"') return opening ? q.open : q.close;
+  // most languages type ' as an apostrophe only; English, Dutch and
+  // German also open (and German closes) single quotes with it
+  if (!sq) return '’';
+  if (opening) return sq.open;
+  // German's closing mark isn't its apostrophe: it closes only a single
+  // quotation that is open in the paragraph
+  if (sq.close !== '’' && isOpen(sq, '')) return sq.close;
+  return '’';
+}
+// Does a quote typed after this text open one? At the start, after a space
+// or a bracket, or after an opening mark (»› and „‚ nest), it does. But
+// ‘ “ « » › ‹ open in some languages and close in others: German »…›…‹«
+// and „…‚…‘“ close with the marks English and Swiss writing open with. So
+// a run of them faces the way the text before it says: after a word or
+// its punctuation (or French's narrow space before »), they closed a
+// quotation, and the quote typed next closes the one around it (#410).
+function quoteOpensAfter(before) {
+  let i = before.length;
+  while (i > 0 && /[‘“«»›‹]/.test(before[i - 1])) i--;
+  if (i === before.length) return before === '' || /[\s([{„‚>]/.test(before[i - 1]);
+  return !/[\p{L}\p{N}\p{M}.,;:!?…)\]}’”\u202f]/u.test(before[i - 1] || '');
+}
+
 // The quotation marks of the language being written: the spellcheck
 // language when one is set, otherwise NEO's own language.
 const QUOTE_STYLES = {
@@ -5247,9 +5482,11 @@ const QUOTE_STYLES = {
   pl: { open: '„', close: '”' },
   ro: { open: '„', close: '”' },
   ru: { open: '«', close: '»' },
+  uk: { open: '«', close: '»' },
   el: { open: '«', close: '»' },
   hu: { open: '„', close: '”' },
   sv: { open: '”', close: '”' },
+  da: { open: '»', close: '«' },                          // »…« (or „…“, kept by bookQuotes)
   ko: { open: '“', close: '”', singles: true }            // ‘…’ inside, as in English
 };
 // The single quotation marks, where ' types them: English and Dutch ‘…’;
@@ -5284,10 +5521,13 @@ function bookQuotes(el) {
     return { '»': own === '»' ? 0 : n(/»(?=[\p{L}\p{N}])/gu), '«': own === '«' ? 0 : n(/«(?=[\p{L}\p{N}])/gu), '„': own === '„' ? 0 : n(/„(?=[\p{L}\p{N}])/gu), own: n(new RegExp(own + '\\s?(?=[\\p{L}\\p{N}])', 'gu')) };
   };
   const body = el && el.closest ? el.closest('.chapter-body') : null;
-  let c = opens(body ? body.textContent : '');
+  // paragraph by paragraph: one ending in » and the next starting with a
+  // letter don't make an opening »
+  const text = !body ? '' : body.children ? [...body.children].map((p) => p.textContent).join('\n') : body.textContent;
+  let c = opens(text);
   if (!c['»'] && !c['«'] && !c['„'] && !c.own && book) c = opens(book.chapterOrder.map((id) => chapterHTML[id] || '').join(' '));
-  // a German book already written in „…“ keeps its marks
-  if (c['„'] > c.own && c['„'] >= c['»'] && c['„'] >= c['«'] && writingLanguage().toLowerCase().startsWith('de')) return { open: '„', close: '“' };
+  // a German or Danish book already written in „…“ keeps its marks
+  if (c['„'] > c.own && c['„'] >= c['»'] && c['„'] >= c['«'] && /^(de|da)\b/i.test(writingLanguage())) return { open: '„', close: '“' };
   if (c['»'] > c.own && c['»'] >= c['«']) return { open: '»', close: writingLanguage().split('-')[0] === 'sv' ? '»' : '«' };
   if (c['«'] > c.own && c['«'] > c['»']) return { open: '«', close: '»' };
   return q;
@@ -5303,6 +5543,7 @@ function bookQuotes(el) {
 const DIALOGUE_DASHES = {
   pt: { open: '—', space: ' ', mid: '—' },   // — Olá — diz ela.
   ru: { open: '—', space: ' ', mid: '—' },
+  uk: { open: '—', space: ' ', mid: '—' },
   hu: { open: '–', space: ' ', mid: '–' },   // – Szia – mondta.
   es: { open: '—', space: '', mid: '—' },    // —Hola —dijo él—.
   en: { open: '—', mid: '–' }                // and every other language: word – word
@@ -5889,18 +6130,59 @@ document.addEventListener('keydown', (e) => {
   window.neo.fullscreenEscape();
 });
 
-// ⌘Enter (Ctrl+Enter): toggle fullscreen from anywhere
+// ---- full screen keys: ⌘Enter (Ctrl+Enter) everywhere, and F11 off the Mac,
+// where most programs use it (on a Mac, F11 shows the desktop)
+function isFullScreenKey(e, mac) {
+  if (e.key === 'F11') return !mac && !e.repeat && !(e.metaKey || e.ctrlKey || e.shiftKey || e.altKey);
+  return e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey;
+}
+// ---- end of full screen keys ----
+
+// toggle fullscreen from anywhere
 document.addEventListener('keydown', (e) => {
-  if (e.key !== 'Enter' || !(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return;
+  if (!isFullScreenKey(e, IS_MAC)) return;
   if (document.querySelector('.modal-backdrop:not([hidden])')) return;
   e.preventDefault();
   window.neo.fullscreenToggle();
 });
 
+// ---- carried alignment rules: a new chapter opens set as the story is (#426) ----
+// The alignment most of a chapter's prose is set in: '' for left (NEO's
+// default), null for a chapter with no prose yet. Breaks, outline ghosts,
+// poetry, flush lines, script lines and empty lines don't count. A tie goes
+// to the later paragraph.
+function chapterAlign(html) {
+  const count = {};
+  let best = null;
+  for (const m of String(html || '').matchAll(/<p\b([^>]*)>([\s\S]*?)<\/p>/g)) {
+    const cls = (/\bclass="([^"]*)"/.exec(m[1]) || [])[1] || '';
+    if (/(^|\s)(scene-break|ghost|poetry|flush|sp-[\w-]+)(\s|$)/.test(cls)) continue;
+    if (!m[2].replace(/<[^>]*>|&nbsp;|\s/g, '')) continue;
+    let a = (/text-align:\s*([a-z]+)/.exec(m[1]) || [])[1] || '';
+    if (!['center', 'right', 'justify'].includes(a)) a = '';
+    count[a] = (count[a] || 0) + 1;
+    if (best === null || count[a] >= count[best]) best = a;
+  }
+  return best;
+}
+// A new chapter's empty first line, set the way the nearest story with
+// words in it is: the chapters before it first, then the ones after (a new
+// first chapter). Pages such as a dedication or a part are passed over.
+function newChapterHtml(order, at, htmlOf, story) {
+  for (const c of [...order.slice(0, at).reverse(), ...order.slice(at)]) {
+    const a = story(c) ? chapterAlign(htmlOf(c)) : null;
+    if (a !== null) return a ? `<p style="text-align: ${a};"><br></p>` : '<p><br></p>';
+  }
+  return '<p><br></p>';
+}
+// ---- end of carried alignment rules ----
+
 function createChapterAt(idx) {
   const chId = 'ch-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+  // (from the order as it stands, before the new chapter joins it)
+  const first = isScript() ? '<p><br></p>' : newChapterHtml(book.chapterOrder, idx, (c) => chapterHTML[c], (c) => isStory(c));
   book.chapterOrder.splice(idx, 0, chId);
-  chapterHTML[chId] = '<p><br></p>';
+  chapterHTML[chId] = first;
   persistChapter(chId);
   saveMeta();
   renderChapters();
@@ -6437,6 +6719,16 @@ function spToFdx(lines, title = {}) {
   if (tp.length) out += '  <TitlePage>\n    <Content>\n' + tp.join('').replace(/^ {4}/gm, '      ') + '    </Content>\n  </TitlePage>\n';
   return out + '</FinalDraft>\n';
 }
+// The corner number of a script page, the first page included. The title
+// page is a sheet of its own and is not numbered here.
+function spPageLabel(page) {
+  return page + '.';
+}
+// A line carries that number when a page starts on it. The first line
+// starts page 1, which is numbered like every page after it.
+function spPageMark(index, brk) {
+  return !!(brk || index === 0);
+}
 // ---- end of screenplay rules ----
 
 const isScript = (meta = book) => !!meta && meta.format === 'screenplay';
@@ -6737,7 +7029,29 @@ function spTab(p, back, ghost) {
 // As the writer types: INT. or EXT. makes a heading, an opening "(" in a
 // speech makes a parenthetical
 function scriptInput(body) {
-  const p = caretBlock(body);
+  let p = caretBlock(body);
+  // the browser can leave the page with no lines at all (⌘A then Delete or
+  // ⌘X, or one more Backspace on the one empty line left deletes that element
+  // itself): anything typed after lands on the page as bare text, which no
+  // line key can act on, and Return does nothing. Re-cover the page — wrap
+  // what is there into one fresh line, the way a new script starts, and put
+  // the caret back at its end
+  // (bare text can come with a stray <br> or a bold run beside it: those
+  // move into the line too)
+  if (!p && !body.querySelector('p')) {
+    const fresh = document.createElement('p');
+    if (body.textContent) { while (body.firstChild) fresh.appendChild(body.firstChild); } else { body.innerHTML = ''; fresh.innerHTML = '<br>'; }
+    body.appendChild(fresh);
+    const sel = window.getSelection();
+    if (document.activeElement === body) {
+      const r = document.createRange();
+      r.selectNodeContents(fresh);
+      r.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(r);
+    }
+    p = fresh;
+  }
   // the whole script cleared (⌘A, then Delete or ⌘X): the one line left
   // starts over as action, the way a new script does, not as whatever the
   // last line deleted was. Left as dialogue, "int." stayed dialogue and
@@ -6866,7 +7180,7 @@ function spRepaginate() {
   const pg = spPaginate(ps.map((p, i) => ({ type: lines[i].type, lines: counts[i], newPage: p.hasAttribute('data-newpage') })));
   ps.forEach((p, i) => {
     const a = pg.at[i];
-    const page = a.brk ? String(a.page) : null;
+    const page = spPageMark(i, a.brk) ? String(a.page) : null;
     if (p.getAttribute('data-pg') !== page) { if (page) p.setAttribute('data-pg', page); else p.removeAttribute('data-pg'); }
     const fill = a.brk ? String(Math.min(SP_LINES_PER_PAGE, a.fill)) : null;
     if (p.getAttribute('data-fill') !== fill) { if (fill) p.setAttribute('data-fill', fill); else p.removeAttribute('data-fill'); }
@@ -7455,7 +7769,7 @@ async function spPdfHtml() {
     <div class="tp-contact">${lines2(library.scriptContact || '')}</div>
     <div class="tp-draft">${lines2(book.draft || '')}</div>
   </div>`;
-  const body = pages.map((rows, k) => `<div class="page">${k ? `<div class="num">${k + 1}.</div>` : ''}<div class="room">${(rows || []).join('')}</div></div>`).join('');
+  const body = pages.map((rows, k) => `<div class="page"><div class="num">${spPageLabel(k + 1)}</div><div class="room">${(rows || []).join('')}</div></div>`).join('');
   return `<!DOCTYPE html><html lang="${escHtml(writingLanguage())}"><head><meta charset="utf-8"><title>${esc(title)}</title><style>
 ${fonts}
 @page { size: 8.5in 11in; margin: 0; }
@@ -7773,7 +8087,10 @@ function queueFootnoteList(body) {
 }
 function renderFootnoteList(body) {
   if (!body || !body.isConnected) return;
+  // only the manuscript's chapters: a snapshot's page (#snap-view) is a
+  // .chapter-body too, and has no notes list (#448)
   const chapter = body.closest('.chapter');
+  if (!chapter) return;
   const marks = [...body.querySelectorAll('.fn')];
   let list = chapter.querySelector(':scope > .fn-list');
   if (!marks.length) { if (list) list.remove(); return; }
@@ -8257,7 +8574,12 @@ function renderContentsLists() {
       const li = document.createElement('li');
       li.className = `t-${e.type} lv${e.level}`;
       li.textContent = e.label;
-      li.onclick = () => focusChapterStart(e.chId);
+      // a line takes you to its page: the caret at its start, and the page in view
+      li.onclick = () => {
+        focusChapterStart(e.chId);
+        const sec = document.querySelector(`.chapter[data-id="${e.chId}"]`);
+        if (sec) sec.scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
+      };
       list.appendChild(li);
     }
   }
@@ -9127,9 +9449,7 @@ function switchTab(name) {
   // the outline's cards, their List/Cards switch and their hint belong to the Outline alone
   for (const id of ['#outline-board', '#outline-views', '#outline-board-hint']) { const el = $(id); if (el) el.hidden = true; }
 
-  snapShown = null;
-  if (window.CSS && CSS.highlights) CSS.highlights.delete('neo-snap-gone');
-  if ($('#snap-view')) { $('#snap-view').hidden = true; $('#snap-view').innerHTML = ''; }
+  hideSnapshot();
   if (name === 'darlings') {
     $('#aux-title').textContent = t('Darlings');
     dList.hidden = false;
@@ -10826,6 +11146,7 @@ function moveSection(fromCh, segIdx, to) {
   if (target === seg) return;
   if (fromCh === to.ch && (to.before === segIdx + 1 || (to.before == null && segIdx === fromSegs.length - 1))) return;
   snapshotStructure('card moved');
+  const settle = holdDay();
   liftSegment(fromBody, seg);
   setSegmentDown(toBody, seg.ps, seg.brk, target);
   if (seg.id && fromCh !== to.ch) {
@@ -10849,6 +11170,7 @@ function moveSection(fromCh, segIdx, to) {
   repointStickies(seg.ps, to.ch);
   scheduleMetaSave();
   updateCounters();
+  settle();
 }
 
 function moveChapterCard(chId, index) {
@@ -10869,6 +11191,7 @@ function sectionToChapter(chId, segIdx) {
   const seg = chapterSegments(chId)[segIdx];
   if (!body || !seg) return;
   snapshotStructure('card to chapter');
+  const settle = holdDay();
   liftSegment(body, seg);
   syncChapter(body, chId);
   const note = seg.id ? sectionNote(chId, seg.id) : null;
@@ -10891,6 +11214,7 @@ function sectionToChapter(chId, segIdx) {
   renderChapters();
   renderStickies();
   updateCounters();
+  settle();
   if (currentTab === 'outline') renderOutline();
 }
 
@@ -12442,7 +12766,6 @@ function updateCounters() {
     return;
   }
   const total = bookWordCount();
-  const known = book.wordCount; // the count before this one (trackDailyWords)
   const wc = $('#word-counter');
   if (isScript()) spCounters();
   else updateBookCounters(total, wc);
@@ -12457,7 +12780,7 @@ function updateCounters() {
       requestPaint(book, bookPlainText());
     }
   }
-  trackDailyWords(total, known);
+  trackDailyWords(total);
 }
 function updateBookCounters(total, wc) {
   if (wordMode === 'book') setText(wc, t('{n} words', { n: total }));
@@ -12492,30 +12815,83 @@ function writingDay(d = new Date()) {
 }
 const todayStr = () => writingDay();
 
-// when the text last came in from disk (a book opening, another device's
-// changes adopted): a drop then isn't the writer cutting (#345)
-let diskWordsAt = 0;
-function trackDailyWords(total, known = book.wordCount) {
+// ---- daily words rules: what today's count is made of (#345) ----
+// A writing day's entry in book.json is { start, end }: end is the story's
+// count when last seen, and end − start the words written that day. Typing
+// and cutting here move that tally. Text read from disk does not: the book
+// opening, a chapter that was still syncing when it did, another device's
+// chapters taken in, its version of a chapter kept beside ours. For those
+// the start moves with the count, so the day keeps exactly what it had.
+// Plain functions of the numbers (scripts/daily-words.test.js).
+const dayWords = (e) => (e && Number.isFinite(e.start) && Number.isFinite(e.end) ? Math.max(0, e.end - e.start) : 0);
+// the day's entry once the story's count is `total`. `seen` is the count
+// the entry last saw on this page, so total − seen is the writer's own
+// typing or cutting; undefined when there's nothing of theirs to add (the
+// count came from disk). Cutting is writing too, but today never goes
+// below zero, and what's written after the cut counts in full.
+function nextDayCount(entry, total, seen) {
+  if (!entry) return { start: total, end: total };
+  let words = dayWords(entry);
+  if (typeof seen === 'number') words = Math.max(0, words + total - seen);
+  return { start: total - words, end: total };
+}
+// another device's days, from its book.json: a day it saw more written in
+// keeps that tally, against this device's own count
+function mergeDayCounts(ours, theirs) {
+  const out = { ...(ours || {}) };
+  if (!theirs || typeof theirs !== 'object') return out;
+  for (const [day, e] of Object.entries(theirs)) {
+    if (!e || !Number.isFinite(e.start) || !Number.isFinite(e.end)) continue;
+    const mine = out[day];
+    if (!mine || !Number.isFinite(mine.end)) out[day] = { start: e.start, end: e.end };
+    else if (dayWords(e) > dayWords(mine)) out[day] = { start: mine.end - dayWords(e), end: mine.end };
+  }
+  return out;
+}
+// ---- end of daily words rules ----
+
+// the story's count that today's entry last saw, and for which book
+let daySeen = null;
+// Text just came in from disk and is on the page: whatever it changed in
+// the count isn't the writer's typing. Called once the page holds it, and
+// before anything can count it as typed.
+function wordsFromDisk() {
+  if (!book) return;
+  const total = bookWordCount();
+  if (daySeen && daySeen.bookId === book.id && sprint && sprint.bookId === book.id) sprint.startCount += total - daySeen.total;
+  daySeen = { bookId: book.id, total };
+}
+// Words moved from one chapter to another (a chapter split in two, a card
+// dropped on another chapter) are neither written nor cut. They leave one
+// chapter a moment before they reach the other, and today never goes below
+// zero, so counted as they happen they would come back as new writing (#471).
+// Call this before the move; the function it returns, once the words have
+// settled, puts the day back as it was.
+function holdDay() {
+  const today = todayStr();
+  const day = book.dailyCounts && book.dailyCounts[today] ? { ...book.dailyCounts[today] } : null;
+  const total = bookWordCount();
+  const run = sprint && sprint.bookId === book.id ? { sprint, start: sprint.startCount } : null; // a sprint's count dips the same way
+  return () => {
+    if (!book || bookWordCount() !== total) return; // words really were written or cut
+    book.dailyCounts = book.dailyCounts || {};
+    book.dailyCounts[today] = day || { start: total, end: total };
+    daySeen = { bookId: book.id, total };
+    if (run && sprint === run.sprint) sprint.startCount = run.start;
+    updateCounters();
+  };
+}
+function trackDailyWords(total) {
   book.dailyCounts = book.dailyCounts || {};
   const today = todayStr();
-  // a book that reads as empty for a moment (its chapters still coming in,
-  // or a synced folder still downloading them) must not set the day's start:
-  // from zero, "today" would count the whole book (#345)
-  if (!total && (known || 0) > 0) return;
-  if (!book.dailyCounts[today]) {
-    book.dailyCounts[today] = { start: total, end: total };
-    scheduleMetaSave();
-  } else if (book.dailyCounts[today].end !== total) {
-    book.dailyCounts[today].end = total;
-  }
-  // Cutting is writing too: words cut below where the day began move the
-  // day's start down with them, so today never reads below zero, and what's
-  // written after the cut counts in full. (Cut what you wrote today, and
-  // today is smaller: that part is honest.)
-  if (total < book.dailyCounts[today].start && Date.now() - diskWordsAt > 3000) {
-    book.dailyCounts[today].start = total;
-    scheduleMetaSave();
-  }
+  const was = book.dailyCounts[today];
+  const seen = daySeen && daySeen.bookId === book.id ? daySeen.total : undefined;
+  const now = nextDayCount(was, total, seen);
+  daySeen = { bookId: book.id, total };
+  book.dailyCounts[today] = now;
+  // a new day, or the writer's cut moving where it began, is saved now; the
+  // rest goes with the next save
+  if (!was || (seen !== undefined && total !== seen && now.start !== was.start)) scheduleMetaSave();
   if (sprint && sprint.bookId !== book.id) sprint = null; // a sprint belongs to the book it began in
   if (sprint && total < sprint.startCount) sprint.startCount = total;
   const wordsToday = Math.max(0, book.dailyCounts[today].end - book.dailyCounts[today].start);
@@ -12680,6 +13056,7 @@ async function keepOtherDeviceVersion(bookId, chId, disk) {
     book.chapterTitles = book.chapterTitles || {};
     book.chapterTitles[twinId] = twinChapterTitle(book.chapterTitles[chId]);
     chapterHTML[twinId] = disk;
+    wordsFromDisk(); // the other device's copy is not today's writing (#345)
     await persistChapter(twinId, disk);
     await saveMeta();
     const caret = captureCaret();
@@ -12739,15 +13116,38 @@ function scheduleMetaSave() {
   clearTimeout(saveTimers.meta);
   saveTimers.meta = setTimeout(saveMeta, 800);
 }
-async function saveMeta() {
+// Chapters taken out of the book here since book.json was last saved are
+// named in it, so another device can tell "deleted there" from "never heard
+// of there" (see knownChapters). One put back is no longer named.
+function noteRemovedChapters() {
+  const here = new Set(book.chapterOrder);
+  let list = (Array.isArray(book.removedChapters) ? book.removedChapters : []).filter((c) => !here.has(c));
+  for (const c of savedOrder) if (!here.has(c) && !list.includes(c)) list.push(c);
+  if (list.length > 400) list = list.slice(-400);
+  if (list.length) book.removedChapters = list; else delete book.removedChapters;
+}
+
+async function saveMeta(again) {
   if (!book || shelfExport) return;
   const bookId = book.id;
+  noteRemovedChapters();
+  for (const c of book.chapterOrder) knownChapters.add(c);
   const sig = metaSig(book);
-  const stamp = await writeBookMeta(bookId, book);
+  const order = [...book.chapterOrder];
+  const stamp = await writeBookMeta(bookId, book, [...knownChapters]);
   // the answer belongs to the book that was saved; another one may be open now
   if (!book || book.id !== bookId) return;
+  if (stamp && Array.isArray(stamp.unseen)) {
+    // another device added a chapter since this one last looked: nothing was
+    // written. Take the chapter in, then save (once; the next save tries again)
+    if (again) return;
+    await refreshFromDisk();
+    if (book && book.id === bookId) await saveMeta(true);
+    return;
+  }
   if (typeof stamp === 'string') book.modified = stamp;
   savedMetaSig = sig;
+  savedOrder = order;
 }
 
 function flushAllSaves(e) {
@@ -12840,6 +13240,30 @@ function textHash(str) {
 function snapsToThin(snaps, now) {
   const newest = snaps.reduce((a, s) => (!a || s.at > a.at ? s : a), null);
   return snaps.filter((s) => s !== newest && s.kind !== SNAP_KEPT && now - s.at > SNAP_KEEP_DAYS * 86400000).map((s) => s.name);
+}
+// Hands each thinned snapshot's chapters on to the next one, then removes it.
+// A chapter the next snapshot lacks is read from the old one (a read that
+// fails throws; an empty chapter is '' and goes on as ''), written, and read
+// back to match before anything is removed. A next snapshot that already has
+// a chapter keeps its own version, which is what readers see from there on.
+// Any failure stops the pass with the source still in place, so the next
+// snapshot tries again.
+async function thinSnapshots(neo, bookId, snaps, now) {
+  for (const gone of snapsToThin(snaps, now)) {
+    const i = snaps.findIndex((s) => s.name === gone);
+    const next = snaps[i + 1];
+    if (i < 0 || !next) continue;
+    for (const f of snaps[i].files) {
+      if (!f.endsWith('.html') || next.files.has(f)) continue;
+      const text = await neo.snapshotRead(bookId, snaps[i].name, f);
+      if ((await neo.snapshotWrite(bookId, next.name, f, text)) === false) { next.files.add(f); continue; } // already there: its own
+      const copy = await neo.snapshotRead(bookId, next.name, f);
+      if (copy !== text) throw new Error(`snapshot thinning: ${f} did not copy to ${next.name} intact`);
+      next.files.add(f);
+    }
+    await neo.snapshotRemove(bookId, gone);
+    snaps.splice(i, 1);
+  }
 }
 // where a chapter's text at snapshots[i] is: the newest snapshot at or
 // before it holding the file (snapshots oldest first, each with `files`)
@@ -12971,19 +13395,12 @@ async function takeSnapshotNow(kind, htmlOf, { ifNoneToday }) {
   snap.files = new Set([...changed.map((c) => c + '.html'), 'snapshot.json']);
   snap.meta = meta;
   snaps.push(snap);
-  // NEO's own old ones go, each handing its chapters on to the next first
-  for (const gone of snapsToThin(snaps, now)) {
-    const i = snaps.findIndex((s) => s.name === gone);
-    const next = snaps[i + 1];
-    if (i < 0 || !next) continue;
-    for (const f of snaps[i].files) {
-      if (!f.endsWith('.html') || next.files.has(f)) continue;
-      const text = await window.neo.snapshotRead(bookId, snaps[i].name, f);
-      await window.neo.snapshotWrite(bookId, next.name, f, text);
-      next.files.add(f);
-    }
-    await window.neo.snapshotRemove(bookId, gone);
-    snaps.splice(i, 1);
+  // NEO's own old ones go, each handing its chapters on to the next first. A
+  // failure leaves them where they are; the next snapshot tries again.
+  try {
+    await thinSnapshots(window.neo, bookId, snaps, now);
+  } catch (err) {
+    logSnap(err);
   }
   renderSnapList();
   return { snap, same: false };
@@ -13035,6 +13452,21 @@ function snapWhy(kind) {
 
 // ---- the list: the right-hand pane, while Darlings is up ----
 let snapShown = null; // the snapshot on the page, or null for the darlings
+// the snapshot on the page goes, and its marks with it
+function hideSnapshot() {
+  snapShown = null;
+  if (window.CSS && CSS.highlights) CSS.highlights.delete('neo-snap-gone');
+  const v = $('#snap-view');
+  if (v) { v.hidden = true; v.innerHTML = ''; }
+}
+// a book that closes takes its snapshots along: the one on the page and
+// the list, so the next book never shows them (#448)
+function forgetSnapshots() {
+  hideSnapshot();
+  snapCache = null;
+  const list = $('#snap-list');
+  if (list) list.innerHTML = '';
+}
 function snapList() {
   let list = $('#snap-list');
   if (list) return list;
@@ -13161,10 +13593,7 @@ async function snapToDarling(range, text) {
 }
 
 function showDarlingsAgain() {
-  snapShown = null;
-  if (window.CSS && CSS.highlights) CSS.highlights.delete('neo-snap-gone');
-  const v = $('#snap-view');
-  if (v) { v.hidden = true; v.innerHTML = ''; }
+  hideSnapshot();
   if (currentTab !== 'darlings') return;
   $('#aux-title').textContent = t('Darlings');
   $('#darlings-list').hidden = false;
@@ -13406,7 +13835,6 @@ let refreshing = false;
 async function refreshFromDisk() {
   if (refreshing || shelfExport) return;
   refreshing = true;
-  diskWordsAt = Date.now();
   bookMetaCache.clear(); // whatever another device wrote, the next redraw reads
   try {
     if (!book) {
@@ -13477,16 +13905,36 @@ async function refreshFromDisk() {
 
     // Then decide it all in one go: nothing waits from here to the page.
     let restructured = false;
+    // the days as this device counted them, and as the other one did (#345)
+    const today = todayStr();
+    const days = mergeDayCounts(book.dailyCounts, meta.dailyCounts);
+    const dayMoved = dayWords(days[today]) !== dayWords((book.dailyCounts || {})[today]);
     if (theirs && metaSig(book) === sigHere) {
       // The other device added, renamed or moved chapters. Whichever
       // book.json stands, no chapter holding words is dropped: theirs keeps
       // the chapters with unsaved words here, and ours (when this device
       // restructured too and hasn't saved yet) takes in the chapters they wrote.
-      const order = [...(mine ? book.chapterOrder : meta.chapterOrder)];
+      const hasWords = (h) => /[^\s]/.test(String(h || '').replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' '));
+      const theirRemoved = new Set(Array.isArray(meta.removedChapters) ? meta.removedChapters : []);
+      const myRemoved = new Set(Array.isArray(book.removedChapters) ? book.removedChapters : []);
+      // (a chapter taken out here, its file gone, that a book.json written
+      // before it heard of that still lists: it stays out)
+      const order = mine ? [...book.chapterOrder] : meta.chapterOrder.filter((c) => !(myRemoved.has(c) && chapterHTML[c] === undefined && !hasWords(incoming[c])));
       const other = mine ? meta.chapterOrder : book.chapterOrder;
+      const kept = []; // chapters of this device's that their book.json doesn't list, and stay
       other.forEach((chId, i) => {
         if (order.includes(chId)) return;
-        if (mine ? !/[^\s]/.test(String(incoming[chId] || '').replace(/<[^>]*>/g, '')) : chapterHTML[chId] === savedHTML[chId]) return;
+        if (mine) {
+          if (!hasWords(incoming[chId])) return;
+        } else if (chapterHTML[chId] === savedHTML[chId]) {
+          // Saved here, and not in their list. They took it out (they say
+          // so, or its file is gone from the disk): it goes. Otherwise their
+          // book.json was written without ever having heard of it (both
+          // devices added a chapter while apart, or an older NEO saved over
+          // the list): a chapter with words in it stays in the book.
+          if (!hasWords(chapterHTML[chId]) || theirRemoved.has(chId) || (stamps && stamps[chId] === undefined)) return;
+        }
+        if (!mine) kept.push(chId);
         const prev = other.slice(0, i).reverse().find((c) => order.includes(c));
         order.splice(prev ? order.indexOf(prev) + 1 : 0, 0, chId);
       });
@@ -13499,9 +13947,25 @@ async function refreshFromDisk() {
         }
         if (mine) {
           book.chapterOrder = order;
+          // what they took out stays named, with what this device took out
+          const removed = [...new Set([...myRemoved, ...theirRemoved])].filter((c) => !order.includes(c));
+          if (removed.length) book.removedChapters = removed; else delete book.removedChapters;
         } else {
-          book = { ...meta, chapterOrder: order, lastPosition: book.lastPosition };
+          const was = book;
+          book = { ...meta, chapterOrder: order, lastPosition: book.lastPosition, dailyCounts: book.dailyCounts };
+          // a chapter kept keeps its name, its kind and its notes
+          for (const chId of kept) {
+            for (const key of ['chapterTitles', 'chapterKinds', 'chapterNotes', 'sectionNotes', 'sceneNotes']) {
+              if (!was[key] || was[key][chId] === undefined) continue;
+              book[key] = { ...(book[key] || {}), [chId]: was[key][chId] };
+            }
+          }
+          if (Array.isArray(book.removedChapters)) {
+            book.removedChapters = book.removedChapters.filter((c) => !order.includes(c));
+            if (!book.removedChapters.length) delete book.removedChapters;
+          }
           savedMetaSig = metaSig(meta);
+          savedOrder = [...meta.chapterOrder];
         }
         if (metaSig(book) !== savedMetaSig) scheduleMetaSave();
         if (!book.chapterOrder.includes(currentChapterId)) currentChapterId = null;
@@ -13509,6 +13973,9 @@ async function refreshFromDisk() {
         restructured = true;
       }
     }
+    // their list has been looked at, whatever was made of it
+    if (Array.isArray(meta.chapterOrder)) for (const chId of meta.chapterOrder) knownChapters.add(chId);
+    book.dailyCounts = days;
     let sideChanged = false;
     for (const name of Object.keys(sides)) {
       const key = bookId + '/' + name;
@@ -13583,6 +14050,7 @@ async function refreshFromDisk() {
       const caret = captureCaret();
       const keepScroll = $('#paper-scroll').scrollTop;
       renderChapters();
+      wordsFromDisk(); // the words that came in were written elsewhere, or before today (#345)
       $('#paper-scroll').scrollTop = keepScroll;
       if (caret) restoreCaret(caret);
       if (restructured) {
@@ -13606,6 +14074,8 @@ async function refreshFromDisk() {
       if (conflicts) toast(t('This chapter also changed on another device. That version is saved as the chapter after it.'), 8000);
       else if (replaced.length) toast(t('Updated from your other device — the text it replaced is in Darlings'), 8000);
       else toast(t('Updated from your other device'));
+    } else if (dayMoved) {
+      updateCounters();
     }
 
     // The writer moved on to the other device since last touching this one:
@@ -13625,7 +14095,6 @@ async function refreshFromDisk() {
   } catch (err) {
     console.error(err);
   } finally {
-    diskWordsAt = Date.now();
     refreshing = false;
   }
 }
@@ -13649,8 +14118,7 @@ async function backToShelf() {
   tabPlaces = {};
   book = null;
   showWindowTitle();
-  snapShown = null;
-  snapCache = null;
+  forgetSnapshots();
   sideCardsKey = '';
   if ($('#side-cards')) $('#side-cards').innerHTML = '';
   currentChapterId = null;
@@ -13857,9 +14325,18 @@ async function structuralUndo(fromRedo) {
       displaced.push({ chId, html: cur });
     }
   }
+  // an action that only changed what a chapter is moved the story's count
+  // with no word written or cut, and so does taking it back (#436)
+  const kindNow = book.chapterKinds || {};
+  const kindsOnly = [...new Set([...Object.keys(kindNow), ...Object.keys(snap.chapterKinds || {})])].some((c) => kindNow[c] !== (snap.chapterKinds || {})[c])
+    && book.chapterOrder.length === snap.chapterOrder.length
+    && book.chapterOrder.every((c, i) => c === snap.chapterOrder[i])
+    && Object.keys(chapterHTML).length === Object.keys(restored).length
+    && Object.keys(restored).every((c) => restored[c] === chapterHTML[c]);
   book.chapterOrder = snap.chapterOrder;
   book.chapterKinds = snap.chapterKinds;
   chapterHTML = restored;
+  if (kindsOnly) wordsFromDisk();
   for (const { chId, html } of displaced) {
     const holder = document.createElement('div');
     holder.innerHTML = html;
@@ -14258,24 +14735,83 @@ function searchRoots() {
   return [$('#aux-editor')];
 }
 
+// ---- find's matching: a paragraph is read as one string, so a phrase that
+// runs into italic or bold, or a word an import split across runs, is found
+// even though its letters sit in several text nodes
+
+// lower case of the same length, so an offset in it is an offset in s
+// ('İ' lowers to two characters and is left as it is)
+function lowerSameLength(s) {
+  const l = s.toLowerCase();
+  if (l.length === s.length) return l;
+  let out = '';
+  for (const c of s) { const lc = c.toLowerCase(); out += lc.length === c.length ? lc : c; }
+  return out;
+}
+
+// every place q appears in texts read end to end, any case, as
+// { from: [node, offset], to: [node, offset] } with to's offset exclusive
+function matchSpans(texts, q) {
+  const found = [];
+  if (!q || !texts.length) return found;
+  const ql = lowerSameLength(q);
+  const all = lowerSameLength(texts.join(''));
+  const starts = [];
+  let at = 0;
+  for (const t of texts) { starts.push(at); at += t.length; }
+  // the node holding the character at i
+  const nodeAt = (i) => {
+    let n = 0;
+    while (n + 1 < starts.length && starts[n + 1] <= i) n++;
+    return n;
+  };
+  let pos = 0;
+  while ((pos = all.indexOf(ql, pos)) !== -1) {
+    const a = nodeAt(pos);
+    const b = nodeAt(pos + q.length - 1);
+    found.push({ from: [a, pos - starts[a]], to: [b, pos + q.length - starts[b]] });
+    pos += q.length;
+  }
+  return found;
+}
+// ---- end of find's matching ----
+
+// a run ends at a paragraph's edge, and around a footnote or placeholder
+// flag (contenteditable="false"), so a Replace never deletes one
+const FIND_BLOCKS = 'p, div, li, h1, h2, h3, h4, h5, h6, blockquote, pre, td, th, [contenteditable="false"]';
+
+// a root's text nodes, cut into the runs one match may cross: a run ends at
+// a paragraph's edge or a line break, never at an <em> or a <strong>
+function textRuns(root) {
+  const runs = [];
+  let run = null;
+  let block = null;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+  let node;
+  while ((node = walker.nextNode())) {
+    if (node.nodeType !== Node.TEXT_NODE) {
+      if (node.tagName === 'BR') run = null;
+      continue;
+    }
+    const b = node.parentElement.closest(FIND_BLOCKS);
+    if (!run || b !== block) { run = []; runs.push(run); block = b; }
+    run.push(node);
+  }
+  return runs;
+}
+
 // every place q appears in the tab, in reading order, any case
 function findRanges(q) {
   const found = [];
   if (!q) return found;
-  const ql = q.toLowerCase();
   for (const body of searchRoots()) {
     if (!body) continue;
-    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
-    let node;
-    while ((node = walker.nextNode())) {
-      const tl = node.textContent.toLowerCase();
-      let pos = 0;
-      while ((pos = tl.indexOf(ql, pos)) !== -1) {
+    for (const run of textRuns(body)) {
+      for (const m of matchSpans(run.map((n) => n.textContent), q)) {
         const range = document.createRange();
-        range.setStart(node, pos);
-        range.setEnd(node, pos + q.length);
+        range.setStart(run[m.from[0]], m.from[1]);
+        range.setEnd(run[m.to[0]], m.to[1]);
         found.push(range);
-        pos += q.length;
       }
     }
   }
@@ -14315,6 +14851,23 @@ function freshSearchIfStale() {
   if (searchState.query !== $('#search-input').value || searchState.tab !== currentTab) runSearch();
 }
 
+// put rep where a match was. A match across formatting takes the formatting
+// of its first letter, and an <em> or <strong> it leaves empty goes with it.
+function replaceRange(range, rep) {
+  const { startContainer: a, startOffset: from, endContainer: b, endOffset: to } = range;
+  if (a === b) { a.replaceData(from, to - from, rep); return; }
+  const top = range.commonAncestorContainer;
+  range.deleteContents();
+  a.insertData(from, rep);
+  let el = b.parentElement;
+  if (!b.data) b.remove();
+  while (el && el !== top && !el.textContent && !el.querySelector('br, img')) {
+    const up = el.parentElement;
+    el.remove();
+    el = up;
+  }
+}
+
 function replaceCurrent() {
   if (currentTab !== 'manuscript') return;
   freshSearchIfStale();
@@ -14330,8 +14883,7 @@ function replaceCurrent() {
     chapter = m.range.startContainer.parentElement.closest('.chapter');
     snapshotStructure('replace');
     breakRun++; // the engine never saw this change: ⌘Z goes to NEO's undo
-    m.range.deleteContents();
-    if (rep) m.range.insertNode(document.createTextNode(rep));
+    replaceRange(m.range, rep);
   } catch {
     runSearch();
     return;
@@ -14348,23 +14900,16 @@ function replaceAllMatches() {
   if (!q || currentTab !== 'manuscript') return;
   snapshotStructure('replace all');
   const rep = $('#replace-input').value;
-  const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
-  let n = 0;
+  // the matches Find shows, last first, so a replacement never moves one still to come
+  const ranges = findRanges(q).reverse();
+  const touched = new Set();
+  for (const range of ranges) {
+    touched.add(range.startContainer.parentElement.closest('.chapter').dataset.id);
+    replaceRange(range, rep);
+  }
+  const n = ranges.length;
   for (const chId of book.chapterOrder) {
-    const body = document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`);
-    if (!body) continue;
-    const nodes = [];
-    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
-    let node;
-    while ((node = walker.nextNode())) nodes.push(node);
-    let touched = false;
-    for (const nd of nodes) {
-      if (nd.textContent.toLowerCase().includes(q.toLowerCase())) {
-        nd.textContent = nd.textContent.replace(re, () => { n++; return rep; });
-        touched = true;
-      }
-    }
-    if (touched) syncChapter(body, chId);
+    if (touched.has(chId)) syncChapter(document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`), chId);
   }
   if (n === 0) undoStack.pop(); // nothing changed, nothing to undo
   else breakRun++; // ⌘Z from inside the text reaches this undo too
@@ -14664,7 +15209,9 @@ async function spellScanEl(el, key) {
 // Mid-paragraph, only a full stop ends a sentence: "Oh! how lovely",
 // "— Quanto falta? — perguntou ele" and "…and then" are the writer's.
 const capsRanges = new Map(); // key → [Range]
-const CAPS_ABBREV = new Set(['mr', 'mrs', 'ms', 'dr', 'st', 'jr', 'sr', 'vs', 'etc', 'e.g', 'i.e', 'cf', 'approx', 'no', 'vol', 'pp', 'p', 'fig', 'ca', 'mt', 'ft', 'lt', 'sgt', 'capt', 'col', 'gen', 'prof', 'rev', 'hon', 'inc', 'ltd', 'co', 'ave', 'a.m', 'p.m', 'sra', 'sr', 'srta', 'dra', 'av', 'ex', 'z.b', 'bzw', 'ggf', 'usw', 'm', 'mme', 'mlle']);
+const CAPS_ABBREV = new Set(['mr', 'mrs', 'ms', 'dr', 'st', 'jr', 'sr', 'vs', 'etc', 'e.g', 'i.e', 'cf', 'approx', 'no', 'vol', 'pp', 'p', 'fig', 'ca', 'mt', 'ft', 'lt', 'sgt', 'capt', 'col', 'gen', 'prof', 'rev', 'hon', 'inc', 'ltd', 'co', 'ave', 'a.m', 'p.m', 'sra', 'sr', 'srta', 'dra', 'av', 'ex', 'z.b', 'bzw', 'ggf', 'usw', 'm', 'mme', 'mlle',
+  // Danish: "vi købte f.eks. æbler" goes on in lowercase
+  'f.eks', 'bl.a', 'dvs', 'osv', 'mv', 'evt', 'jf', 'kl', 'nr', 'pga', 'mht', 'inkl']);
 function capitalSlips(el) {
   const out = [];
   if (typeof el.matches !== 'function' || !el.matches('.chapter-body')) return out;
@@ -14742,6 +15289,14 @@ function scheduleSpellRescan(key, el) {
   saveTimers['sp-' + key] = setTimeout(() => { if (spellOn) spellScanEl(el, key); }, 600);
 }
 
+// A book opened again has new pages under the same chapter ids: they're
+// checked anew, not counted as checked with underlines on the old pages
+function forgetSpelling() {
+  spellScanned = new Set();
+  spellRanges = new Map();
+  capsRanges.clear();
+}
+
 function toggleSpellcheck() {
   spellOn = !spellOn;
   if (spellOn) {
@@ -14763,7 +15318,7 @@ function toggleSpellcheck() {
 const SPELL_LANGUAGE_NAMES = {
   'en-US': t('US English'), 'en-GB': t('UK English'), 'en-CA': t('Canadian English'),
   'en-AU': t('Australian English'), fr: t('French'), es: t('Spanish'), de: t('German'),
-  nl: t('Dutch'), pl: t('Polish'), 'pt-BR': t('Brazilian Portuguese'), ro: t('Romanian'), ru: t('Russian'), hu: t('Hungarian'), sv: t('Swedish')
+  nl: t('Dutch'), pl: t('Polish'), 'pt-BR': t('Brazilian Portuguese'), ro: t('Romanian'), ru: t('Russian'), uk: t('Ukrainian'), hu: t('Hungarian'), sv: t('Swedish'), da: t('Danish')
 };
 async function changeSpellLanguage(code) {
   const ok = await window.neo.setSpellLanguage(code);
@@ -14841,7 +15396,9 @@ document.addEventListener('contextmenu', async (e) => {
       const r = document.createRange();
       r.setStart(node, a); r.setEnd(node, b);
       sel.removeAllRanges(); sel.addRange(r);
-      document.execCommand('insertText', false, s);
+      // a dictionary suggests its apostrophe straight (м'ясо); on the page
+      // it's ’, as NEO types it
+      document.execCommand('insertText', false, s.replace(/(?<=[\p{L}\p{M}])'(?=[\p{L}\p{M}])/gu, '’'));
       if (key) spellScanEl(spellElFor(key), key);
     },
     learn: async () => {
@@ -14973,6 +15530,17 @@ function typewriterRoom() {
   paper.style.setProperty('--typewriter-room', Math.max(120, Math.ceil(room)) + 'px');
 }
 new ResizeObserver(() => typewriterRoom()).observe($('#chapters'));
+// the soft hyphens' ticks (non-breaking marks) follow anything that moves the words
+new ResizeObserver(() => queueSoftHyphenTicks()).observe($('#chapters'));
+$('#paper-scroll').addEventListener('scroll', () => queueSoftHyphenTicks(false), { passive: true });
+window.addEventListener('resize', () => queueSoftHyphenTicks());
+if (document.fonts) document.fonts.addEventListener('loadingdone', () => queueSoftHyphenTicks());
+// a paragraph's alignment, poetry or flush, and the opening paragraph's
+// marks, are set on it as attributes: the words move, but nothing is typed
+// and no sheet changes size
+new MutationObserver((records) => {
+  if (records.some((r) => r.target.closest('.chapter-body, .chapter-head') || r.target.matches('.chapter'))) queueSoftHyphenTicks();
+}).observe($('#chapters'), { subtree: true, attributes: true, attributeFilter: ['style', 'class', 'dir', 'data-first', 'data-speech'] });
 window.addEventListener('resize', typewriterRoom);
 function applyNbspMarks() {
   if (window.neo.nbspMarksState) window.neo.nbspMarksState(nbspMarksEnabled); // the Format menu's tick
@@ -15008,6 +15576,38 @@ document.addEventListener('keydown', (e) => {
 }, true);
 document.addEventListener('mousedown', () => { typewriterByKeyboard = false; }, true);
 
+// ---- typewriter rules: where the page goes as the writer types ----
+// The writing height is 45% of the window, with a band of about three lines
+// around it. The page's new scrollTop for a caret at caretTop, or null while
+// the caret is inside the band.
+function typewriterScrollTarget(scrollTop, caretTop, windowHeight, lineHeight) {
+  const diff = caretTop - windowHeight * 0.45;
+  return Math.abs(diff) <= lineHeight * 1.5 ? null : scrollTop + diff;
+}
+// A letter typed, Chromium scrolls its caret into view on its own. In the
+// Pages view it measures a line that a page break carried to the next page
+// at the top of its paragraph, back on the page before, and scrolls up to
+// that while the caret sits in plain view; the typewriter then glided the
+// page back, and every letter at the top of a page bobbed it (#453). NEO
+// keeps the caret in sight itself, so a scroll like that goes back. Given
+// the scrollTop when the letter went in (was) and now, where the typewriter
+// is gliding (glide, or null), the caret's top and bottom in the window as
+// they were at `was`, and the scroller's top and bottom: the scrollTop to
+// put back, or null to leave it.
+function strayCaretScroll({ was, now, glide, caretTop, caretBottom, viewTop, viewBottom }) {
+  if (now === was) return null;
+  // the typewriter's own glide, on its way
+  if (glide !== null && Math.sign(now - was) === Math.sign(glide - was) && Math.abs(now - was) <= Math.abs(glide - was) + 1) return null;
+  // a caret that was out of sight, even in part, is Chromium's to bring in
+  if (caretTop < viewTop || caretBottom > viewBottom) return null;
+  return was;
+}
+// ---- end of typewriter rules ----
+
+// where the typewriter is gliding the page, until it gets there
+let typewriterGlide = null;
+$('#paper-scroll').addEventListener('scrollend', () => { typewriterGlide = null; });
+
 document.addEventListener('selectionchange', () => {
   if (!typewriterEnabled || !book || currentTab !== 'manuscript' || !typewriterByKeyboard) return;
   const sel = window.getSelection();
@@ -15020,12 +15620,35 @@ document.addEventListener('selectionchange', () => {
       let rect = sel.getRangeAt(0).getBoundingClientRect();
       if (!rect || (rect.top === 0 && rect.height === 0)) rect = el.getBoundingClientRect();
       const lineHeight = parseFloat(getComputedStyle(el).lineHeight) || 30;
-      const diff = rect.top - window.innerHeight * 0.45;
-      // a band of about three lines around the writing height
-      if (Math.abs(diff) <= lineHeight * 1.5) return;
       const scroller = $('#paper-scroll');
-      scroller.scrollTo({ top: scroller.scrollTop + diff, behavior: scrollBehavior() });
+      const top = typewriterScrollTarget(scroller.scrollTop, rect.top, window.innerHeight, lineHeight);
+      if (top === null) return;
+      typewriterGlide = top;
+      scroller.scrollTo({ top, behavior: scrollBehavior() });
     } catch { /* selection mid-mutation; skip this frame */ }
+  });
+});
+
+// Chromium's scroll comes after the input event, inside the same keystroke,
+// so the page is checked in the next frame, before it is painted. (On the
+// window, so NEO's own input handlers, revealCaret among them, have run.)
+window.addEventListener('input', (e) => {
+  if (!pagesOn() || currentTab !== 'manuscript') return;
+  if (!e.target.closest || !e.target.closest('.chapter-body')) return;
+  const sc = $('#paper-scroll');
+  const was = sc.scrollTop;
+  requestAnimationFrame(() => {
+    const now = sc.scrollTop;
+    if (now === was) return;
+    const rect = caretRect();
+    if (!rect) return;
+    const box = sc.getBoundingClientRect();
+    const back = strayCaretScroll({
+      was, now, glide: typewriterGlide,
+      caretTop: rect.top + now - was, caretBottom: rect.bottom + now - was,
+      viewTop: box.top, viewBottom: box.bottom
+    });
+    if (back !== null) sc.scrollTop = back;
   });
 });
 
@@ -15065,7 +15688,6 @@ let viewStateSent = '';
 // the writer turns it down). The shelf goes with writing.
 const brightAside = () => !!book && !$('#editor-view').hidden && currentTab !== 'manuscript';
 function brightNow() {
-  if (!moreOn()) return brightAside() || SYSTEM_CONTRAST.matches; // the defaults
   if (brightAside()) return library.uiBrightAside === undefined ? true : !!library.uiBrightAside;
   return library.uiBright === undefined ? SYSTEM_CONTRAST.matches : !!library.uiBright;
 }
@@ -15179,7 +15801,7 @@ function updateFocus() {
   else if (focusLevel === 'paragraph') { r = document.createRange(); r.selectNodeContents(p); }
   if (r) CSS.highlights.set('neo-focus', new Highlight(r));
   else CSS.highlights.delete('neo-focus');
-  // highlights can't reach ::first-letter, so the drop cap gets a class
+  // highlights can't reach the drop cap (it isn't text), so it gets a class
   // on its chapter body (a class on the body itself is never saved)
   document.querySelectorAll('.chapter-body.focus-cap').forEach((b) => b.classList.remove('focus-cap'));
   const body = p.parentElement;
@@ -15486,6 +16108,7 @@ function applyFonts() {
     document.documentElement.style.setProperty('--dropcap-font', DROPCAP_FONTS[f.dropcap]);
   }
   document.body.classList.toggle('no-dropcap', f.dropcap === 'none');
+  refreshDropCaps(true);
   document.body.classList.toggle('night', library.pageTheme === 'night');
   // Light: the paper page in a light room, the whole app with it
   document.body.classList.toggle('light', library.pageTheme === 'light');
@@ -15500,6 +16123,7 @@ function applyFonts() {
   const size = Math.min(EDITOR_SIZE_MAX, Math.max(EDITOR_SIZE_MIN, library.editorFontSize || 17));
   document.documentElement.style.setProperty('--editor-size', size + 'px');
   applyPageZoom();
+  queueSoftHyphenTicks(); // another face can wrap the same lines differently
 }
 
 // A built-in choice, or a font the writer picked from their own computer.
@@ -15759,7 +16383,7 @@ function bookShortcutSections() {
       [K('⌘E', 'Ctrl+E'), tk('Email a draft to yourself')]
     ] },
     { title: tk('View & window'), rows: [
-      [[K('⌘⇧F', 'Ctrl+Shift+F'), K('⌘Enter', 'Ctrl+Enter')], tk('Toggle full screen')],
+      [[K('⌘⇧F', 'Ctrl+Shift+F'), K('⌘Enter', 'Ctrl+Enter'), ...(IS_MAC ? [] : ['F11'])], tk('Toggle full screen')],
       [K('⌘⇧T', 'Ctrl+Shift+T'), tk('Toggle typewriter scrolling')],
       ...(more ? [[K('⌘⇧O', 'Ctrl+Shift+O'), tk('Cycle focus mode'), tk('Off → paragraph → sentence → off.')]] : []),
       [IS_MAC ? '⌥⌘↓' : ['Ctrl+Alt+↓', 'Ctrl+Page Down'], tk('Go to the next chapter')],
@@ -17075,11 +17699,47 @@ function nonBreakingRuns(text) {
   return runs;
 }
 
+// Soft hyphens (U+00AD) show too while the marks are on: the places a long
+// word (Donau|dampf|schiff|fahrt) may be broken by a reader that doesn't
+// hyphenate on its own. Mid-line a soft hyphen is zero wide, so a highlight
+// has nothing to paint; it gets a patch of the same light gray instead, an
+// en space wide and laid over the letters either side, like a space the
+// word could open at. Where the line does break there, the patch still
+// stands before the hyphen the browser draws, so a soft hyphen at a line's
+// end reads differently from a typed one.
+const SOFT_HYPHEN = '\u00ad';
+function softHyphenOffsets(text) {
+  const out = [];
+  for (let i = text.indexOf(SOFT_HYPHEN); i !== -1; i = text.indexOf(SOFT_HYPHEN, i + 1)) out.push(i);
+  return out;
+}
+// Where a soft hyphen's mark goes on its sheet: from the box the browser
+// gives the character and the sheet's corner. The box is zero wide, mid-line
+// and at a break alike (the hyphen drawn there lies outside it), so its left
+// edge is the break point whichever way the line runs. The mark is 0.5em
+// wide (an en space), centred on that point and laid over the letters
+// either side, so the line keeps its length. Its top and height are the
+// box's own, the same the gray highlight paints for a no-break space beside
+// it, from above the letters to below the baseline. No box (the text isn't
+// laid out) means no mark.
+const SHY_MARK_WIDTH = 0.5;
+function softHyphenTick(rect, origin, em) {
+  if (!rect || !(rect.height > 0)) return null;
+  const width = em * SHY_MARK_WIDTH;
+  return {
+    left: rect.left - origin.left - width / 2,
+    top: rect.top - origin.top,
+    width,
+    height: rect.height,
+  };
+}
+
 // Paints those characters in every open chapter with the CSS Highlight API,
 // so the marks never enter the chapter HTML — the same door search,
 // spellcheck and focus use. Off means nothing is painted at all.
 const NB_MARK_NAME = 'neo-nb-mark';
 function paintNonBreakingMarks() {
+  queueSoftHyphenTicks();
   if (!(window.CSS && CSS.highlights && window.Highlight)) return;
   CSS.highlights.delete(NB_MARK_NAME);
   if (!nbspMarksEnabled) return;
@@ -17099,6 +17759,79 @@ function paintNonBreakingMarks() {
   CSS.highlights.set(NB_MARK_NAME, marks);
 }
 // ---- end of non-breaking marks ----
+
+// The soft hyphens' ticks are drawn in a layer of their own on each sheet,
+// beside the chapter's text and never inside it: nothing to save, select or
+// put the caret in, and screen readers pass it by. Only the sheets in or near
+// view get one, so a long book costs no more than the chapter on screen.
+// Anything that can move the words (typing, the page's width, zoom, type
+// size, a font arriving, a paragraph's
+// alignment, poetry or flush) starts a new pass;
+// scrolling only draws the sheets that come into view. One frame at a time.
+let shyPass = 0;
+let shyFrame = 0;
+const shyDrawn = new WeakMap(); // sheet → the pass its ticks were drawn for
+function queueSoftHyphenTicks(moved = true) {
+  if (moved) shyPass += 1;
+  if (shyFrame || (!nbspMarksEnabled && !document.querySelector('.shy-ticks'))) return;
+  shyFrame = requestAnimationFrame(drawSoftHyphenTicks);
+}
+function softHyphenRect(node, i) {
+  const range = document.createRange();
+  range.setStart(node, i);
+  range.setEnd(node, i + 1);
+  for (const r of range.getClientRects()) if (r.height > 0) return r;
+  range.collapse(true);
+  const r = range.getBoundingClientRect();
+  return r.height > 0 ? r : null;
+}
+function drawSoftHyphenTicks() {
+  shyFrame = 0;
+  const view = $('#paper-scroll').getBoundingClientRect();
+  for (const sheet of $$('#chapters .chapter')) {
+    const body = sheet.querySelector(':scope > .chapter-body');
+    const box = sheet.getBoundingClientRect();
+    const near = nbspMarksEnabled && body && !body.hidden && view.height > 0 &&
+      box.bottom > view.top - view.height && box.top < view.bottom + view.height;
+    let layer = sheet.querySelector(':scope > .shy-ticks');
+    if (!near) {
+      if (layer) layer.remove();
+      shyDrawn.delete(sheet);
+      continue;
+    }
+    if (shyDrawn.get(sheet) === shyPass) continue;
+    shyDrawn.set(sheet, shyPass);
+    const origin = { left: box.left + sheet.clientLeft, top: box.top + sheet.clientTop };
+    const ems = new Map();
+    const ticks = document.createDocumentFragment();
+    const walk = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walk.nextNode())) {
+      if (!node.data.includes(SOFT_HYPHEN)) continue;
+      const parent = node.parentElement;
+      if (!ems.has(parent)) ems.set(parent, parseFloat(getComputedStyle(parent).fontSize) || 17);
+      for (const i of softHyphenOffsets(node.data)) {
+        const at = softHyphenTick(softHyphenRect(node, i), origin, ems.get(parent));
+        if (!at) continue;
+        const tick = document.createElement('span');
+        tick.style.left = at.left + 'px';
+        tick.style.top = at.top + 'px';
+        tick.style.width = at.width + 'px';
+        tick.style.height = at.height + 'px';
+        ticks.appendChild(tick);
+      }
+    }
+    if (!ticks.childNodes.length) { if (layer) layer.remove(); continue; }
+    if (!layer) {
+      layer = document.createElement('div');
+      layer.className = 'shy-ticks';
+      layer.setAttribute('aria-hidden', 'true');
+      layer.contentEditable = 'false';
+      sheet.appendChild(layer);
+    }
+    layer.replaceChildren(ticks);
+  }
+}
 function paraRuns(pHtml, flip) {
   const holder = document.createElement('template'); // inert: nothing loads or runs
   holder.innerHTML = pHtml;
@@ -17654,14 +18387,14 @@ p.attr { font-style: normal; font-size: 0.85em; letter-spacing: 0.05em; margin-t
 .part .pl { display: block; }
 .part .pt { display: block; margin-top: 0.8em; font-size: 1.6em; letter-spacing: 0; text-transform: none; }
 .opener h1 { margin: 0; font-size: 1.8em; letter-spacing: 0.02em; text-transform: none; }
-.opener .sub { text-indent: 0; margin-top: 0.6em; font-style: italic; }
+.opener .sub { text-align: center; text-indent: 0; margin-top: 0.6em; font-style: italic; }
 .opener .byline { margin: 3em 0 0; }
 nav#toc ol { list-style: none; padding-left: 0; }
 nav#toc ol ol { padding-left: 1.5em; }
 .titlepage { text-align: center; margin-top: 30%; }
 .titlepage h2 { font-size: 2em; margin: 0; }
-.titlepage .sub { font-style: italic; }
-.titlepage .auth { margin-top: 4em; letter-spacing: 0.3em; text-transform: uppercase; }
+.titlepage .sub { text-align: center; text-indent: 0; font-style: italic; }
+.titlepage .auth { text-align: center; text-indent: 0; margin-top: 4em; letter-spacing: 0.3em; text-transform: uppercase; }
 .coverimg { text-align: center; margin: 0; padding: 0; }
 .coverimg img { max-width: 100%; max-height: 100%; }` },
     { path: 'OEBPS/cover.xhtml', content: `<?xml version="1.0" encoding="utf-8"?>
@@ -18631,7 +19364,6 @@ function usesMoreFeatures(lib) {
     (!!lib.pageWidth && lib.pageWidth !== 'regular') ||
     (lib.uiZoom !== undefined && snapZoom(lib.uiZoom) !== 1) ||
     (!!lib.focus && lib.focus !== 'off') ||
-    lib.uiBright !== undefined || lib.uiBrightAside === false ||
     !!lib.markdownOff || !!lib.exportCustomChapterTitles ||
     (!!lib.spellLanguage && lang(lib.spellLanguage) !== lang(NeoI18n.getLocale()));
 }

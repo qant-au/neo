@@ -152,20 +152,13 @@
     await writeText(path, JSON.stringify(data, null, 2));
   }
 
-  // the same rule as main.js chapterDiverged: the disk copy differs from
-  // what this device last knew, holds words, and has a word the new text lacks
+  // the same rule as main.js chapterDiverged: the disk copy is not exactly
+  // what this device last knew, is not already the new text, and holds
+  // words. Formatting, order and deletions are conflicts too.
   function chapterDiverged(cur, expected, html) {
     if (cur === expected || cur === html) return false;
-    const bag = (h) => {
-      const m = new Map();
-      for (const w of String(h || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').split(/\s+/)) if (w) m.set(w, (m.get(w) || 0) + 1);
-      return m;
-    };
-    const there = bag(cur);
-    if (!there.size) return false;
-    const here = bag(html);
-    for (const [w, n] of there) if (n > (here.get(w) || 0)) return true;
-    return false;
+    const words = String(cur || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').trim();
+    return words !== '';
   }
 
   const bookDir = (bookId) => p(bookId);
@@ -234,7 +227,15 @@
       } catch { /* an empty list is honest enough */ }
       return out;
     },
-    writeBookMeta: async (bookId, meta) => {
+    // the same rule as main.js book:writeMeta: a chapter book.json lists that
+    // this page has never seen was added on another device; it is taken in
+    // before anything is written over the list that names it
+    writeBookMeta: async (bookId, meta, known) => {
+      if (Array.isArray(known)) {
+        const disk = await readJSONFile(p(bookId, 'book.json'), null);
+        const unseen = disk && Array.isArray(disk.chapterOrder) ? disk.chapterOrder.filter((c) => typeof c === 'string' && !known.includes(c)) : [];
+        if (unseen.length) return { unseen };
+      }
       meta.modified = new Date().toISOString();
       await writeJSONFile(p(bookId, 'book.json'), meta);
       return meta.modified;
@@ -371,12 +372,16 @@
       }
       return out;
     },
+    // throws when the file can't be read: only an empty chapter reads as ''
+    // (the desktop's rule; thinning depends on it)
     snapshotRead: async (bookId, name, file) => {
       await fetchCloud(p(bookId, 'snapshots', name, file));
-      try { return await readText(p(bookId, 'snapshots', name, file)); } catch { return ''; }
+      return readText(p(bookId, 'snapshots', name, file));
     },
+    // written once, as on the desktop: false when the file is already there
     snapshotWrite: async (bookId, name, file, text) => {
       await ensureDir(p(bookId, 'snapshots', name));
+      try { await FS().stat(at(p(bookId, 'snapshots', name, file))); return false; } catch { /* free */ }
       await writeText(p(bookId, 'snapshots', name, file), text);
       return true;
     },
@@ -466,6 +471,8 @@
     importPick: async () => [],
     pathForFile: () => null,
     checkForUpdate: async () => ({ error: true }),
+    pocketLibrary: async () => ({ offer: false }), // (this is NEO Pocket)
+    usePocketLibrary: async () => false,
     openRelease: async () => true,
     fullscreenEscape: async () => false,
     fullscreenToggle: async () => true,

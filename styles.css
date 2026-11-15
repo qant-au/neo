@@ -635,6 +635,9 @@ body.light .print-modal select, body.light .print-modal textarea { background: #
 .fr-font:hover { border-color: #666; }
 .fr-font.sel { border-color: var(--accent); color: var(--accent); }
 .fr-font .fr-cap { font-size: 20px; margin-right: 7px; }
+/* a Mac that already has NEO Pocket's books in iCloud Drive */
+#fr-pocket { margin: 20px 0 0; font-size: 13px; color: var(--muted); }
+#fr-pocket .btn-quiet { display: block; color: var(--accent); font-size: 13px; padding: 4px 0; }
 .font-list {
   display: flex; flex-direction: column; gap: 6px;
   max-height: 50vh; overflow-y: auto; margin-top: 12px; padding-right: 10px;
@@ -702,8 +705,26 @@ body.night #aux-editor * { color: inherit; }
 /* the sentence Read Aloud is on (⌘⇧U) */
 ::highlight(neo-speak) { background: rgba(201, 168, 106, 0.28); }
 /* Non-Breaking Marks (Format menu): the spaces and hyphens a wrap must not
-   break at — U+00A0, U+202F and U+2011 — in one unobtrusive light gray */
-::highlight(neo-nb-mark) { background: rgba(127, 127, 127, 0.25); }
+   break at — U+00A0, U+202F and U+2011 — in one quiet tint of the ink,
+   painted behind the letters. A little stronger on the night page, where a
+   faint patch on dark paper all but disappears */
+:root { --nb-mark-tint: color-mix(in srgb, var(--ink) 15%, transparent); }
+body.night { --nb-mark-tint: color-mix(in srgb, var(--ink) 22%, transparent); }
+/* ...and a soft hyphen (U+00AD), zero wide mid-line, as a patch of the same
+   tint an en space wide, centred where the word may break and reaching over
+   the letters either side so the line keeps its length. Drawn in a layer of
+   its own on the sheet, outside the text (app.js, drawSoftHyphenTicks, which
+   sets each one's place and size, as tall as a no-break space's box). The
+   layer sits behind the text like the highlight does, so the letters keep
+   their full ink: the sheet holds its own stacking while the layer is there,
+   and the layer goes under the sheet's text but over its paper */
+::highlight(neo-nb-mark), .shy-ticks span { background: var(--nb-mark-tint); }
+.chapter.sheet:has(> .shy-ticks) { isolation: isolate; }
+.shy-ticks {
+  position: absolute; inset: 0; z-index: -1;
+  pointer-events: none; user-select: none; -webkit-user-select: none;
+}
+.shy-ticks span { position: absolute; }
 
 /* Each page of the book is its own sheet of paper */
 #paper {
@@ -724,9 +745,8 @@ body.night ::highlight(neo-focus) { color: #d6d2c6; }
    (dragging a selection into the next paragraph moves the focus with it) */
 body.focus-mode .sheet ::selection { color: #1c1c1c; }
 body.focus-mode.night .sheet ::selection { color: #d6d2c6; }
-/* the drop cap sits outside the highlight's reach; same selector as the cap
-   itself so no other paragraph grows a ::first-letter */
-body.focus-mode:not(.no-dropcap) .chapter-body.focus-cap:not(.cap-off):not(.no-cap):not(.opens-dialogue) p[data-first]::first-letter { color: var(--ink); }
+/* the drop cap sits outside the highlight's reach (it isn't text) */
+body.focus-mode:not(.no-dropcap) .chapter-body.focus-cap.has-cap:not(.no-cap):not(.opens-dialogue) p[data-first]::before { color: var(--ink); }
 .sheet {
   background: var(--paper); color: var(--ink);
   padding: 70px var(--page-pad-x) 90px;
@@ -825,6 +845,11 @@ body.paged #paper:not(.script) #tp-author { font-size: calc(14px * var(--page-zo
   transition: opacity 0.15s;
 }
 .chapter-head:hover .ch-title:empty::before { opacity: 1; }
+/* a chapter with no title yet takes no room for the dash or the title, so
+   "Chapter X" stays centered; the prompt hangs off its right edge on hover */
+.chapter-head:not(.has-title):not(.no-number) .ch-sep { display: inline-block; width: 0; margin: 0; overflow: hidden; vertical-align: bottom; }
+.chapter-head:not(.has-title):not(.no-number) .ch-title { width: 0; min-width: 0; white-space: nowrap; vertical-align: bottom; }
+.chapter-head:not(.has-title):not(.no-number) .ch-title:empty::before { margin-left: 14px; }
 /* an unnumbered chapter goes by its title alone: no number, no dash, and
    the "add a title" prompt stays in view until it has one */
 .chapter-head.no-number .ch-num, .chapter-head.no-number .ch-sep { display: none; }
@@ -871,7 +896,7 @@ body.paged #paper:not(.script) #tp-author { font-size: calc(14px * var(--page-zo
 /* a block straight after the chapter's opening paragraph, while its drop
    cap is set, starts where that paragraph's words do beside the cap: --cap-in
    is that offset in ems of the prose, measured by app.js (capIndent) */
-body:not(.no-dropcap) .chapter-body:not(.cap-off):not(.no-cap):not(.opens-dialogue) p[data-first] ~ p.code:not(p[data-first] ~ p:not(.code) ~ p.code) {
+body:not(.no-dropcap) .chapter-body.has-cap:not(.no-cap):not(.opens-dialogue) p[data-first] ~ p.code:not(p[data-first] ~ p:not(.code) ~ p.code) {
   margin-left: calc(var(--cap-in, 2) * 1em / 0.82);
 }
 .chapter-body p.code:not(p.code + p.code) { margin-top: 0.9em; }
@@ -883,13 +908,27 @@ body:not(.no-dropcap) .chapter-body:not(.cap-off):not(.no-cap):not(.opens-dialog
    Inline boxes, not a block: to the editor it stays one piece of the
    sentence, so the caret and typing keep their places */
 .chapter-body .math { cursor: text; }
-/* cap-off while the caret is in the first paragraph: the rule must stop
-   MATCHING entirely — a matching first-letter rule, even styled to nothing,
-   makes the engine split the text internally, which corrupts deletes */
-body:not(.no-dropcap) .chapter-body:not(.cap-off):not(.no-cap):not(.opens-dialogue) p[data-first]::first-letter {
-  font-size: 3.4em; float: left; line-height: 0.8;
-  padding: 4px 8px 0 0; font-family: var(--dropcap-font);
+/* The drop cap is drawn beside the opening paragraph, not made of its first
+   letter (setDropCap in app.js): a ::first-letter makes the engine split the
+   paragraph's text in two, which left doubled letters on the page when
+   words beside it were typed or deleted. The real first letter is painted
+   clear and drawn back under the cap by its own width, so the paragraph is
+   one plain run of text to edit and the cap never has to step aside. */
+body:not(.no-dropcap) .chapter-body.has-cap:not(.no-cap):not(.opens-dialogue) p[data-first]::before {
+  content: var(--cap, ""); float: inline-start; font-size: 3.4em; line-height: 0.8;
+  padding: 4px 0 0 0; padding-inline-end: 8px; font-family: var(--dropcap-font);
+  font-style: normal; font-weight: normal; text-indent: 0; white-space: pre;
+  letter-spacing: normal; text-transform: none;
 }
+body:not(.no-dropcap) .chapter-body.has-cap:not(.no-cap):not(.opens-dialogue) p[data-first] {
+  text-indent: calc(-1 * var(--cap-w, 0em)) !important;
+}
+::highlight(neo-cap) { color: transparent; -webkit-text-fill-color: transparent; }
+/* …but not in what's copied out to another program (cap-copying, app.js) */
+body.cap-copying:not(.no-dropcap) .chapter-body.has-cap:not(.no-cap):not(.opens-dialogue) p[data-first] { text-indent: 0 !important; }
+/* a selection in focus mode sets its own ink, that letter's too: the cap
+   covers it until the selection lets go (cap-sel, set in app.js) */
+body.focus-mode .chapter-body.cap-sel.has-cap p[data-first]::before { position: relative; z-index: 1; background: var(--paper); }
 /* NEO's spellcheck pass: flagged words, painted like search matches */
 ::highlight(neo-spell) {
   text-decoration: underline wavy #cf5c56;
@@ -938,6 +977,9 @@ body.bright .spell-menu button { color: #eee; }
   background: #f6e3b8; border-bottom: 2px solid var(--red);
   padding: 0 3px; border-radius: 2px; cursor: pointer;
 }
+/* the night page's ink is light, and the flag took it: white on the yellow.
+   It keeps the dark ink the gold buttons use instead (#454) */
+body.night .ph-mark { color: #191919; }
 
 /* --- The pages a book carries, in the manuscript, set as they'll print --- */
 .chapter.bookpage { display: flex; flex-direction: column; }
@@ -1262,6 +1304,10 @@ body.focus-mode .walk-note { opacity: 0.6; }
 #nav-hotzone, #side-hotzone {
   width: clamp(18px, calc((100vw - min((var(--sheet-w) + var(--page-gutter)) * var(--page-zoom, 1), 94vw)) / 2 - 24px), 96px);
 }
+/* over the outline's cards there is no page margin to wake from: the cards
+   run nearly to the window's edges, and a wide zone opened the pane over the
+   outermost ones (#523) */
+#editor-view.outline-tab.board-on #nav-hotzone, #editor-view.outline-tab.board-on #side-hotzone { width: 18px; }
 #nav-pane {
   position: fixed; left: 0; top: 0; bottom: 40px; width: 248px;
   background: var(--pane); border-right: 1px solid #2c2c2c;
@@ -2035,20 +2081,29 @@ body.night #paper.script #chapters { box-shadow: 0 4px 30px rgba(0,0,0,0.7); }
 .sp-geom > p.sp-transition { text-align: right; }
 
 /* a new page: the rest of the last page, its foot, the gap, the next page's
-   head with its number (page one has none) */
-.sp-geom > p[data-pg] { margin-top: calc((var(--fill, 0) + 12) * 1em + var(--sp-gap)) !important; }
+   head with its number. Page one has its number in the head it already has
+   (no gap above the first line). data-fill is the blank foot of the page
+   before, so only a page that follows another gets the gap. */
+.sp-geom > p[data-pg][data-fill] { margin-top: calc((var(--fill, 0) + 12) * 1em + var(--sp-gap)) !important; }
 .sp-geom > p[data-pg]::before {
   content: attr(data-pg) '.';
   position: absolute; z-index: 1; pointer-events: none;
   left: calc(-9em - var(--ind) - 40px); width: calc(51em + 80px);
-  top: calc(-6em - var(--sp-gap)); height: calc(6em + var(--sp-gap));
-  box-sizing: border-box; padding: calc(var(--sp-gap) + 2.5em) calc(5.7em + 40px) 0 0;
+  box-sizing: border-box;
   text-align: right; text-transform: none; font-weight: 400; font-style: normal; text-decoration: none;
   color: var(--ink);
+}
+.sp-geom > p[data-pg][data-fill]::before {
+  top: calc(-6em - var(--sp-gap)); height: calc(6em + var(--sp-gap));
+  padding: calc(var(--sp-gap) + 2.5em) calc(5.7em + 40px) 0 0;
   /* the room's color across the gap; the pages' edges shaded on the paper's width only */
   background:
     linear-gradient(to bottom, rgba(0,0,0,0.22), transparent 10px, transparent calc(var(--sp-gap) - 10px), rgba(0,0,0,0.22) var(--sp-gap), transparent var(--sp-gap)) 40px 0 / calc(100% - 80px) 100% no-repeat,
     linear-gradient(to bottom, var(--bg) var(--sp-gap), transparent var(--sp-gap)) 0 0 / 100% 100% no-repeat;
+}
+.sp-geom > p[data-pg]:not([data-fill])::before {
+  top: -6em; height: 6em;
+  padding: 2.5em calc(5.7em + 40px) 0 0;
 }
 /* (CONT'D) when a voice comes back after action, and the gray suggestion
    at the caret. Neither is typed or saved: the exports write CONT'D out. */
@@ -2099,15 +2154,19 @@ body.night #paper.script #chapters { box-shadow: 0 4px 30px rgba(0,0,0,0.7); }
 .sp-narrow > p.sp-paren { margin-left: 4.5em; margin-right: 3em; --ind: 4.5em; }
 .sp-narrow > p.sp-dialogue { margin-left: 2.5em; margin-right: 2em; --ind: 2.5em; }
 .sp-narrow > p.sp-transition { text-align: right; }
-.sp-narrow > p[data-pg] { margin-top: 2.6em !important; }
+.sp-narrow > p[data-pg][data-fill] { margin-top: 2.6em !important; }
 .sp-narrow > p[data-pg]::before {
   content: attr(data-pg) '.';
   position: absolute; pointer-events: none;
-  left: calc(-18px - var(--ind)); width: var(--sp-fullw, 100vw); top: -1.9em;
-  box-sizing: border-box; padding: 2px 18px 0 0; border-top: 1px dashed color-mix(in srgb, var(--ink) 25%, var(--paper));
+  left: calc(-18px - var(--ind)); width: var(--sp-fullw, 100vw);
+  box-sizing: border-box; padding: 2px 18px 0 0;
   text-align: right; line-height: 1.2; text-transform: none; font-weight: 400; font-style: normal;
   color: color-mix(in srgb, var(--ink) 50%, var(--paper));
 }
+.sp-narrow > p[data-pg][data-fill]::before {
+  top: -1.9em; border-top: 1px dashed color-mix(in srgb, var(--ink) 25%, var(--paper));
+}
+.sp-narrow > p[data-pg]:not([data-fill])::before { top: -1.4em; }
 #paper.script.narrow #title-page {
   width: auto; height: auto; min-height: 60vh; padding: 48px 18px; display: flex; flex-direction: column;
   justify-content: center; gap: 1.3em; line-height: 1.3;
@@ -2231,9 +2290,10 @@ body.light .snap-ch:hover { color: #1c1a17; }
 .snap-chapter.same .snap-tag { color: color-mix(in srgb, var(--ink) 45%, var(--paper)); }
 .snap-chapter.same .snap-body { opacity: 0.55; }
 .snap-body { user-select: text; cursor: text; }
-.snap-body p.snap-gone { background: rgba(192, 57, 43, 0.14); box-shadow: -6px 0 0 rgba(192, 57, 43, 0.14), 6px 0 0 rgba(192, 57, 43, 0.14); }
-::highlight(neo-snap-gone) { background-color: rgba(192, 57, 43, 0.24); }
-
+.snap-body p.snap-gone { background: rgba(192, 57, 43, 0.14); box-shadow: -6px 0 0 rgba(192, 57, 43, 0.14), 6px 0 0 rgba(192, 57, 43, 0.14); text-decoration: underline 2px #c0392b; text-decoration-skip-ink: none; }
+::highlight(neo-snap-gone) { background-color: rgba(192, 57, 43, 0.24); text-decoration: underline 2px #c0392b; text-decoration-skip-ink: none; }
+body.night .snap-body p.snap-gone { background: rgba(224, 112, 95, 0.3); box-shadow: -6px 0 0 rgba(224, 112, 95, 0.3), 6px 0 0 rgba(224, 112, 95, 0.3); text-decoration-color: #e0705f; }
+body.night ::highlight(neo-snap-gone) { background-color: rgba(224, 112, 95, 0.4); text-decoration-color: #e0705f; }
 /* the Outline's cards for where the caret is, atop the right-hand pane (#340) */
 #side-cards { display: flex; flex-direction: column; gap: 10px; padding: 0 12px; }
 #side-cards:not(:empty) { margin-bottom: 22px; }
@@ -2299,7 +2359,9 @@ body.light .side-card textarea::placeholder { color: #a39d90; }
 }
 #notes-up:hover, #notes-up:focus-visible { color: var(--accent); }
 #editor-view:not(.notes-tab) #notes-up, #editor-view:not(.notes-tab) #notes-outline { display: none; }
-#aux-paper.notes-chapter #aux-title { margin-bottom: 18px; }
+/* only on the Notes tab: the class stays on the page after it, and the
+   Outline's List/Cards switch is set 30px up into the heading's 40px (#455) */
+#editor-view.notes-tab #aux-paper.notes-chapter #aux-title { margin-bottom: 18px; }
 #notes-outline {
   max-width: 34em; margin: 0 auto 40px; text-align: center; color: #8a8a8a;
   font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;

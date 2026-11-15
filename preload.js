@@ -12,7 +12,7 @@ contextBridge.exposeInMainWorld('neo', {
   duplicateBook: (bookId, title) => ipcRenderer.invoke('book:duplicate', bookId, title),
   listBooks: () => ipcRenderer.invoke('library:listBooks'),
   readBookMeta: (bookId) => ipcRenderer.invoke('book:readMeta', bookId),
-  writeBookMeta: (bookId, meta) => ipcRenderer.invoke('book:writeMeta', bookId, meta),
+  writeBookMeta: (bookId, meta, known) => ipcRenderer.invoke('book:writeMeta', bookId, meta, known),
   deleteBook: (bookId, title) => ipcRenderer.invoke('book:delete', bookId, title),
 
   readChapter: (bookId, chId) => ipcRenderer.invoke('chapter:read', bookId, chId),
@@ -47,6 +47,8 @@ contextBridge.exposeInMainWorld('neo', {
   fullscreenEscape: () => ipcRenderer.invoke('fullscreen:escape'),
   fullscreenToggle: () => ipcRenderer.invoke('fullscreen:toggle'),
   checkForUpdate: () => ipcRenderer.invoke('update:check'),
+  pocketLibrary: () => ipcRenderer.invoke('library:pocket'),
+  usePocketLibrary: () => ipcRenderer.invoke('library:usePocket'),
   installUpdate: () => ipcRenderer.invoke('update:install'),
   spellCheckWords: (words) => ipcRenderer.invoke('spell:check', words),
   spellSuggest: (word) => ipcRenderer.invoke('spell:suggest', word),

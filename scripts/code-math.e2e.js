@@ -194,7 +194,9 @@ test('maths shows typeset, centred on its own line, unshaded, the words after it
       math: !!span.shadowRoot.querySelector('math msup'),
       display: cs.display, align: cs.textAlign, bg: getComputedStyle(span).backgroundColor,
       below: r.getBoundingClientRect().top >= box.getBoundingClientRect().bottom - 1,
-      afterLeft: Math.round(r.getBoundingClientRect().left - pl), indent: Math.round(2 * em),
+      afterLeft: Math.round(r.getBoundingClientRect().left - pl),
+      // the indent, or beside the drop cap in the paragraph it is set in
+      indent: p.matches(CAP_P) ? (() => { const r2 = document.createRange(); r2.setStart(p.firstChild, 1); r2.setEnd(p.firstChild, 2); return Math.round(r2.getBoundingClientRect().left - pl); })() : Math.round(2 * em),
       codeBg: cc.backgroundColor, codePad: cc.paddingLeft + ' ' + cc.paddingRight,
       codeLeft: Math.round(code.getBoundingClientRect().left - pl),
       // straight after the drop cap paragraph, the block starts beside the cap

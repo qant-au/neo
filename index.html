@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <!-- only NEO's own script files run: nothing pasted or read from a book can -->
-  <meta http-equiv="Content-Security-Policy" content="script-src 'self'; object-src 'none'" />
+  <meta http-equiv="Content-Security-Policy" content="script-src 'self'; object-src 'none'; frame-src 'none'" />
   <title>NEO</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
@@ -49,6 +49,7 @@
             </button>
           </div>
         </div>
+        <p id="fr-pocket" hidden><span data-i18n>Writing in NEO Pocket on your iPad or iPhone?</span> <button id="fr-pocket-btn" class="btn-quiet" data-i18n>Use iCloud Drive</button></p>
       </div>
       <div id="fr-step2" hidden>
         <h2 data-i18n>How should the page look?</h2>

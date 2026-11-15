@@ -163,20 +163,263 @@ ipcMain.handle('i18n:reload', (e) => {
 
 // File → Library Folder…: point NEO at any folder, or back at the default.
 // The library is plain files, so the writer moves them; NEO only follows.
+// NEO Pocket's folder in iCloud Drive, as this Mac sees it. It's there once
+// the app has run on an iPad or iPhone signed in to the same iCloud account;
+// desktop NEO never makes it (only the app it belongs to can).
+function pocketCloudLibrary() {
+  if (process.platform !== 'darwin') return null;
+  const dir = path.join(app.getPath('home'), 'Library', 'Mobile Documents', 'iCloud~com~hughhowey~neo~pocket', 'Documents');
+  try { if (!fs.statSync(dir).isDirectory()) return null; } catch { return null; }
+  return path.join(dir, 'NEO Library');
+}
+
+// what a library folder holds that moving it carries: books and anything
+// else the writer keeps there, but not NEO's own half-written spares
+const MOVE_SKIP = new Set(['library.json', '.neo-write-test', '.DS_Store']);
+function libraryEntries(dir) {
+  try { return fs.readdirSync(dir).filter((n) => !MOVE_SKIP.has(n) && !/\.(tmp|bak)$/.test(n)); } catch { return []; }
+}
+const hasBooks = (dir) => libraryEntries(dir).some((n) => n.startsWith('book-'));
+// a is inside b, or is b
+const insideFolder = (a, b) => { const r = path.relative(path.resolve(b), path.resolve(a)); return !r.startsWith('..') && !path.isAbsolute(r); };
+
+// Two libraries become one: the shelves of `from` join those of `into` (a
+// shelf both have keeps every book of both), and so do the pen names. What
+// `into` already says stays; `from` fills in what it lacks.
+function mergeLibraries(into, from) {
+  if (!into) return from;
+  if (!from) return into;
+  const out = { ...from, ...into };
+  const shelves = (into.shelves || []).map((sh) => ({ ...sh, bookIds: [...(sh.bookIds || [])] }));
+  for (const sh of from.shelves || []) {
+    const same = shelves.find((x) => x.id === sh.id);
+    if (same) {
+      for (const b of sh.bookIds || []) if (!same.bookIds.includes(b)) same.bookIds.push(b);
+    } else {
+      shelves.push({ ...sh, bookIds: [...(sh.bookIds || [])] });
+    }
+  }
+  out.shelves = shelves;
+  const authors = (into.authors || []).map((a) => ({ ...a }));
+  for (const a of from.authors || []) {
+    const same = authors.find((x) => x.id === a.id);
+    if (!same) authors.push({ ...a });
+    else if ((!same.name || same.name === 'Anonymous') && a.name) same.name = a.name;
+  }
+  if (authors.length) out.authors = authors;
+  out.penNames = [...new Set([...(into.penNames || []), ...(from.penNames || [])])];
+  out.authorName = into.authorName || from.authorName || '';
+  out.firstRunDone = !!(into.firstRunDone || from.firstRunDone);
+  return out;
+}
+
+// every file of a folder, by its path inside it, with its size
+function treeSizes(dir, base = dir, out = new Map()) {
+  for (const n of fs.readdirSync(dir)) {
+    const f = path.join(dir, n);
+    const st = fs.statSync(f);
+    if (st.isDirectory()) treeSizes(f, base, out);
+    else out.set(path.relative(base, f), st.size);
+  }
+  return out;
+}
+
+// The books of one library folder copied into another, beside whatever is
+// there already (a book both have keeps the copy that's there), checked file
+// by file, and library.json merged. Nothing leaves `from`: the caller puts it
+// in the Trash once this has worked. If anything fails, what was copied is
+// taken away again and the error goes up, so `to` is as it was.
+function moveLibrary(from, to) {
+  fs.mkdirSync(to, { recursive: true });
+  const made = [];
+  try {
+    for (const name of libraryEntries(from)) {
+      const src = path.join(from, name);
+      const dst = path.join(to, name);
+      if (fs.existsSync(dst)) continue;
+      made.push(dst);
+      fs.cpSync(src, dst, { recursive: true, errorOnExist: true, force: false, preserveTimestamps: true });
+      if (fs.statSync(src).isDirectory()) {
+        const a = treeSizes(src), b = treeSizes(dst);
+        for (const [f, size] of a) if (b.get(f) !== size) throw Object.assign(new Error('Not every file came across: ' + path.join(name, f)), { code: 'EINCOMPLETE' });
+      } else if (fs.statSync(src).size !== fs.statSync(dst).size) {
+        throw Object.assign(new Error('Not every file came across: ' + name), { code: 'EINCOMPLETE' });
+      }
+    }
+    const mine = readJSON(path.join(from, 'library.json'), null);
+    const theirsFile = path.join(to, 'library.json');
+    const theirs = fs.existsSync(theirsFile) ? readJSON(theirsFile, null) : null;
+    if (mine || theirs) writeJSON(theirsFile, mergeLibraries(theirs, mine));
+  } catch (err) {
+    for (const p of made) { try { fs.rmSync(p, { recursive: true, force: true }); } catch { /* as much as can go */ } }
+    throw err;
+  }
+}
+
+// Move the books, with the window closed so nothing writes behind the move:
+// everything typed is saved first. Returns false (and says why) when the
+// books stayed where they were.
+let movingLibrary = false;
+async function moveLibraryAndClose(win, from, to) {
+  movingLibrary = true;
+  try {
+    if (win && !win.isDestroyed()) {
+      await Promise.race([win.webContents.executeJavaScript('typeof flushAllSaves === "function" && flushAllSaves(), true'), new Promise((r) => setTimeout(r, 3000))]);
+      await new Promise((r) => setTimeout(r, 800)); // the saves it started land
+    }
+  } catch { /* a window that's already gone has nothing left to save */ }
+  for (const w of BrowserWindow.getAllWindows()) { try { w.destroy(); } catch { /* gone */ } }
+  try {
+    const theirs = path.join(to, 'library.json');
+    const wait = fs.existsSync(theirs) ? whenLocal([theirs]) : null;
+    if (wait && (await wait).size) throw cloudError(theirs);
+    moveLibrary(from, to);
+  } catch (err) {
+    logError('move library', err);
+    await dialog.showMessageBox({
+      type: 'warning',
+      message: t('Your books weren’t moved'),
+      detail: (err && err.code === 'ECLOUD'
+        ? t('iCloud is still bringing NEO Pocket’s books to this Mac. Try again in a minute.')
+        : String((err && err.message) || err)) + '\n\n' + t('Nothing was changed. Your books are still in:\n{dir}', { dir: from }),
+      buttons: [t('OK')]
+    });
+    return false;
+  }
+  try {
+    const { shell } = require('electron');
+    await shell.trashItem(from);
+  } catch (err) {
+    logError('trash old library', err); // a drive with no Trash: the old copy simply stays
+  }
+  return true;
+}
+
+// NEO Pocket on the App Store
+const POCKET_STORE_URL = 'https://apps.apple.com/app/id6816721843';
+
+// This library into NEO Pocket's folder in iCloud Drive: the books move there
+// (when there are any) and NEO restarts in it. File → Library Folder…, the
+// question NEO asks once, Help → NEO for iPad and iPhone… and the welcome
+// screen all come here.
+async function useCloudLibrary(win) {
+  const cloud = pocketCloudLibrary();
+  if (!cloud || path.resolve(cloud) === path.resolve(LIBRARY_DIR)) return false;
+  if (hasBooks(LIBRARY_DIR) && !(await moveLibraryAndClose(win, LIBRARY_DIR, cloud))) {
+    app.relaunch(); // the window closed for the move: open again where the books still are
+    app.exit(0);
+    return false;
+  }
+  const settings = readSettings();
+  settings.libraryDir = cloud;
+  writeSettings(settings);
+  app.relaunch();
+  app.exit(0);
+  return true;
+}
+
+// Once NEO Pocket has made its folder in iCloud Drive (an iPad or iPhone
+// signed in to this Mac's iCloud), NEO asks once whether this library should
+// go there too. Not Now is an answer: it never asks again on this Mac. The
+// same button waits in File → Library Folder… and Help → NEO for iPad and
+// iPhone…. A first run asks on its own welcome screen instead.
+let pocketAsking = false;
+async function askAboutPocket() {
+  if (pocketAsking) return;
+  const cloud = pocketCloudLibrary();
+  if (!cloud || path.resolve(cloud) === path.resolve(LIBRARY_DIR)) return;
+  const settings = readSettings();
+  if (settings.pocketAsked) return;
+  const lib = parseJSONFile(LIBRARY_FILE);
+  if (!lib || !lib.firstRunDone) return;
+  pocketAsking = true;
+  try {
+    settings.pocketAsked = true;
+    writeSettings(settings);
+    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+    const r = await dialog.showMessageBox(win, {
+      type: 'question',
+      message: t('Share this library with NEO Pocket?'),
+      detail: t('NEO Pocket’s folder is in iCloud Drive on this Mac. Use iCloud Drive to write in the same books on your iPad and iPhone. NEO moves your books there and restarts.'),
+      buttons: [t('Use iCloud Drive'), t('Not Now')],
+      defaultId: 0,
+      cancelId: 1
+    });
+    if (r.response === 0) await useCloudLibrary(win);
+  } finally {
+    pocketAsking = false;
+  }
+}
+
+// Help → NEO for iPad and iPhone…: what NEO Pocket is, where to get it, and
+// (on a Mac that has its folder) the same Use iCloud Drive button
+async function showPocketInfo() {
+  const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+  const cloud = pocketCloudLibrary();
+  const shared = !!cloud && path.resolve(cloud) === path.resolve(LIBRARY_DIR);
+  const offer = !!cloud && !shared;
+  const lines = [t('NEO Pocket is NEO for iPad and iPhone, free on the App Store.')];
+  if (process.platform === 'darwin') {
+    lines.push(shared
+      ? t('This library is in NEO Pocket’s folder in iCloud Drive, so your iPad and iPhone write in the same books.')
+      : offer
+        ? t('Use iCloud Drive to write in the same books on this Mac and on your iPad and iPhone. NEO moves your books there and restarts.')
+        : t('Open NEO Pocket once on your iPad or iPhone with iCloud Drive turned on, then come back here to share this library with it.'));
+  }
+  const choices = [...(offer ? ['cloud'] : []), 'store', 'ok'];
+  const label = { cloud: t('Use iCloud Drive'), store: t('Get NEO Pocket'), ok: t('OK') };
+  const r = await dialog.showMessageBox(win, {
+    type: 'info',
+    message: t('NEO for iPad and iPhone'),
+    detail: lines.join('\n\n'),
+    buttons: choices.map((c) => label[c]),
+    defaultId: 0,
+    cancelId: choices.length - 1
+  });
+  const choice = choices[r.response];
+  if (choice === 'store') {
+    const { shell } = require('electron');
+    await shell.openExternal(POCKET_STORE_URL);
+  } else if (choice === 'cloud') {
+    await useCloudLibrary(win);
+  }
+}
+
+// the welcome screen's own offer: a writer who started in NEO Pocket opens
+// its books here, setup and all
+ipcMain.handle('library:pocket', () => {
+  const cloud = pocketCloudLibrary();
+  const offer = !!cloud && path.resolve(cloud) !== path.resolve(LIBRARY_DIR);
+  return { offer, books: offer && hasBooks(cloud) };
+});
+ipcMain.handle('library:usePocket', async () => useCloudLibrary(BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0]));
+
 async function chooseLibraryFolder() {
   const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
   const defaultDir = path.join(app.getPath('documents'), 'NEO Library');
   const custom = LIBRARY_DIR !== defaultDir;
+  // NEO Pocket's folder in iCloud Drive, once an iPad or iPhone has made it
+  const cloud = pocketCloudLibrary();
+  const offerCloud = !!cloud && path.resolve(cloud) !== path.resolve(LIBRARY_DIR);
+  const choices = [...(offerCloud ? ['cloud'] : []), 'choose', ...(custom ? ['default'] : []), 'cancel'];
+  const label = { cloud: t('Use iCloud Drive'), choose: t('Choose Folder…'), default: t('Use Default Folder'), cancel: t('Cancel') };
   const ask = await dialog.showMessageBox(win, {
     type: 'question',
     message: t('Library folder'),
-    detail: t('Your books live in:\n{dir}\n\nChoose another folder and NEO restarts there. Existing books stay where they are — move the files yourself if you want them along.', { dir: LIBRARY_DIR }),
-    buttons: custom ? [t('Choose Folder…'), t('Use Default Folder'), t('Cancel')] : [t('Choose Folder…'), t('Cancel')],
+    detail: t('Your books live in:\n{dir}', { dir: LIBRARY_DIR }) + '\n\n' + (offerCloud
+      ? t('Use iCloud Drive to write in the same books on your iPad and iPhone with NEO Pocket. NEO moves your books there and restarts.')
+      : t('Choose another folder and NEO restarts there.')),
+    buttons: choices.map((c) => label[c]),
     defaultId: 0,
-    cancelId: custom ? 2 : 1
+    cancelId: choices.length - 1
   });
+  const choice = choices[ask.response];
   let next = null;
-  if (ask.response === 0) {
+  let move = false;
+  if (choice === 'cloud') {
+    await useCloudLibrary(win);
+    return;
+  } else if (choice === 'choose') {
     const r = await dialog.showOpenDialog(win, {
       title: t('Choose a folder for your NEO library'),
       defaultPath: LIBRARY_DIR,
@@ -184,14 +427,36 @@ async function chooseLibraryFolder() {
     });
     if (r.canceled || !r.filePaths[0]) return;
     next = r.filePaths[0];
-  } else if (custom && ask.response === 1) {
-    next = null; // back to the default
+  } else if (choice === 'default') {
+    next = defaultDir;
   } else {
     return;
   }
-  if (next === LIBRARY_DIR) return;
+  if (path.resolve(next) === path.resolve(LIBRARY_DIR)) return;
+  // a folder inside the library, or the library inside it, can't take a move;
+  // nor can a library in iCloud Drive, whose books may still be up in iCloud
+  const fromCloud = LIBRARY_DIR.includes(path.sep + 'Mobile Documents' + path.sep);
+  if (!fromCloud && hasBooks(LIBRARY_DIR) && !insideFolder(next, LIBRARY_DIR) && !insideFolder(LIBRARY_DIR, next)) {
+    const trash = process.platform === 'win32' ? t('NEO moves your books from\n{from}\ninto\n{to}\nand puts the old folder in the Recycle Bin.', { from: LIBRARY_DIR, to: next })
+      : t('NEO moves your books from\n{from}\ninto\n{to}\nand puts the old folder in the Trash.', { from: LIBRARY_DIR, to: next });
+    const r = await dialog.showMessageBox(win, {
+      type: 'question',
+      message: t('Bring your books along?'),
+      detail: trash,
+      buttons: [t('Move Books'), t('Leave Them'), t('Cancel')],
+      defaultId: 0,
+      cancelId: 2
+    });
+    if (r.response === 2) return;
+    move = r.response === 0;
+  }
+  if (move && !(await moveLibraryAndClose(win, LIBRARY_DIR, next))) {
+    app.relaunch(); // the window closed for the move: open again where the books still are
+    app.exit(0);
+    return;
+  }
   const settings = readSettings();
-  if (next) settings.libraryDir = next; else delete settings.libraryDir;
+  if (path.resolve(next) !== path.resolve(defaultDir)) settings.libraryDir = next; else delete settings.libraryDir;
   writeSettings(settings);
   app.relaunch();
   app.exit(0);
@@ -201,18 +466,30 @@ async function chooseLibraryFolder() {
 // ransomware protection) refuses new files in Documents to apps it doesn't
 // know, and NEO is one. A small file written and removed tells.
 let lastFolderError = null;
+// A folder in Dropbox or one an antivirus watches can hold a file for a
+// moment as it is made: the test file is tried again a few times, and once
+// it was written, failing to delete it is no reason to say the folder can't
+// be saved in (#474).
+const PROBE_TRIES = 3;
+const PROBE_RETRY = ['EBUSY', 'EPERM', 'EACCES', 'EAGAIN'];
 function folderWritable(dir) {
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-    const probe = path.join(dir, '.neo-write-test');
-    fs.writeFileSync(probe, 'ok');
-    fs.unlinkSync(probe);
-    lastFolderError = null;
-    return true;
-  } catch (err) {
-    lastFolderError = err;
-    logError('library folder not writable: ' + dir, err);
-    return false;
+  const probe = path.join(dir, '.neo-write-test');
+  for (let n = 1; ; n++) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(probe, 'ok');
+      try { fs.unlinkSync(probe); } catch { /* it is only a test file: the next one writes over it */ }
+      lastFolderError = null;
+      return true;
+    } catch (err) {
+      if (n < PROBE_TRIES && PROBE_RETRY.includes(err.code)) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150 * n);
+        continue;
+      }
+      lastFolderError = err;
+      logError('library folder not writable: ' + dir, err);
+      return false;
+    }
   }
 }
 const isBlockedWrite = (err) => !!err && ['EPERM', 'EACCES', 'EROFS'].includes(err.code);
@@ -786,12 +1063,35 @@ function readBookMeta(bookId) {
   return rebuildBookMeta(bookId);
 }
 
-ipcMain.handle('book:writeMeta', (_e, bookId, meta) => {
+// `known` is every chapter the window holds or has held for this book. When
+// book.json on disk lists one it has never seen, another device added a
+// chapter since this window last looked: nothing is written, and the window
+// is told, so it takes the chapter in first. (book.json is saved whole at
+// every pause in typing; written blind, it dropped the other device's new
+// chapter from the book, its words left in a file no list named.)
+ipcMain.handle('book:writeMeta', (_e, bookId, meta, known) => {
+  const file = path.join(bookDir(bookId), 'book.json');
+  if (Array.isArray(known)) {
+    const unseen = unseenChapters(file, known);
+    if (unseen.length) return { unseen };
+  }
   meta.modified = new Date().toISOString();
-  writeJSON(path.join(bookDir(bookId), 'book.json'), meta);
+  writeJSON(file, meta);
   writeCatalog();
   return meta.modified;
 });
+
+// shared with Pocket's bridge (same rule)
+function unseenChapters(file, known) {
+  let disk = null;
+  try {
+    if (isCloudOnly(file)) return [];
+    disk = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch { return []; } // no book.json yet, or one that can't be read: nothing to compare
+  if (!disk || !Array.isArray(disk.chapterOrder)) return [];
+  const seen = new Set(known);
+  return disk.chapterOrder.filter((c) => typeof c === 'string' && !seen.has(c));
+}
 
 // {chapterId: mtime and size} for a book's chapter files — how refreshFromDisk
 // tells what changed without re-reading every chapter. The size is there
@@ -821,8 +1121,8 @@ ipcMain.handle('chapter:read', (_e, bookId, chapterId) => {
 });
 
 // `expected` is the text the window last read or wrote for this chapter.
-// When the file holds something else (another device wrote it since, and
-// it isn't just an older copy of these words), nothing is written: the
+// When the file holds something else (another device wrote it since, even
+// if only formatting, order or a deletion changed), nothing is written: the
 // window is handed that text to keep as its own chapter first, so neither
 // version is lost to a save that happened before the next look at the disk.
 ipcMain.handle('chapter:write', (_e, bookId, chapterId, html, expected) => {
@@ -840,20 +1140,15 @@ ipcMain.handle('chapter:write', (_e, bookId, chapterId, html, expected) => {
   writeFileDurable(file, html);
   return true;
 });
-// shared with Pocket's bridge (same rule): the disk copy differs from what
-// this device last knew, holds words, and has a word the new text lacks
+// shared with Pocket's bridge (same rule): the disk copy is not exactly what
+// this device last knew (`expected`) and is not already the new text (a
+// retry or an identical write), and it holds words. Any other revision,
+// formatting, order and deletions included, is a conflict: the disk text
+// is handed back to be kept as a twin before anything is replaced.
 function chapterDiverged(cur, expected, html) {
   if (cur === expected || cur === html) return false;
-  const bag = (h) => {
-    const m = new Map();
-    for (const w of String(h || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').split(/\s+/)) if (w) m.set(w, (m.get(w) || 0) + 1);
-    return m;
-  };
-  const there = bag(cur);
-  if (!there.size) return false;
-  const here = bag(html);
-  for (const [w, n] of there) if (n > (here.get(w) || 0)) return true;
-  return false;
+  const words = String(cur || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').trim();
+  return words !== '';
 }
 
 ipcMain.handle('chapter:delete', (_e, bookId, chapterId) => {
@@ -900,11 +1195,13 @@ ipcMain.handle('snapshot:list', (_e, bookId) => {
   }
   return out;
 });
+// A file that can't be read throws (missing, no permission, still in iCloud):
+// only a chapter that is really empty reads as ''. Thinning relies on telling
+// them apart, so it never carries an empty stand-in forward.
 ipcMain.handle('snapshot:read', (_e, bookId, name, file) => {
-  let fp;
-  try { fp = snapshotFile(bookId, name, file); } catch { return ''; }
-  const read = () => { try { return fs.readFileSync(fp, 'utf8'); } catch { return ''; } };
-  return afterLocal([fp], read, () => '');
+  const fp = snapshotFile(bookId, name, file);
+  const read = () => fs.readFileSync(fp, 'utf8');
+  return afterLocal([fp], read, () => { throw cloudError(fp); });
 });
 ipcMain.handle('snapshot:write', (_e, bookId, name, file, text) => {
   const target = snapshotFile(bookId, name, file);
@@ -1808,6 +2105,7 @@ const CHAPTER_WORDS = new RegExp('^(' + [
   // on its own it is an English word, and "Capitol Hill was quiet." is prose
   'capitol(?=\\s+\\d)', 'capitolul', 'partea',
   'глава', 'пролог', 'эпилог', 'часть',                            // ru
+  'розділ', 'епілог', 'частина',                                   // uk (глава, пролог above)
   'κεφάλαιο', 'κεφαλαιο', 'πρόλογος', 'προλογος',
   'επίλογος', 'επιλογος', 'μέρος', 'μερος',
   'ραψωδία', 'ραψωδια',                                             // el
@@ -2177,6 +2475,9 @@ function createWindow() {
     // menu bar lives in that frame (KDE Plasma showed no menu, and Alt
     // found nothing to show)
     ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset' } : {}),
+    // Linux shows the window's own icon in its title bar and task bar; an
+    // AppImage has no installed one to fall back on (#440)
+    ...(process.platform === 'linux' ? { icon: path.join(__dirname, 'build', 'icon.png') } : {}),
     backgroundColor: roomColor(libraryPageTheme()),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -2188,9 +2489,22 @@ function createWindow() {
       spellcheck: true
     }
   });
+  if (process.platform === 'win32') {
+    win.on('query-session-end', holdUpdateForShutdown);
+    win.on('session-end', holdUpdateForShutdown);
+  }
   // a trial says so in the window bar
   if (TRY_DIR) win.on('page-title-updated', (e, title) => { e.preventDefault(); win.setTitle(title + ' (trial copy)'); });
   win.loadFile('index.html');
+  // NEO's window only ever shows NEO. A chapter's file can hold a link (one
+  // that came in a book folder from someone else, say), and clicked where the
+  // page is read-only, in History, it took the whole window to that address,
+  // which then held every key to the library this window has. Nothing
+  // navigates this window away, and nothing opens a second one from it.
+  win.webContents.on('will-navigate', (e, url) => {
+    if (url !== win.webContents.getURL()) e.preventDefault();
+  });
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   // The menu bar follows the real full-screen state, whoever changed it.
   // Electron only puts the bar back after a full screen it entered itself,
   // so once a window manager's own full-screen key had been used (Sway, i3),
@@ -2272,7 +2586,9 @@ const SPELL_LANGUAGES = {
   'ro': { label: 'Română', pkg: 'dictionary-ro' },
   'hu': { label: 'Magyar', pkg: 'dictionary-hu' },
   'ru': { label: 'Русский', pkg: 'dictionary-ru' },
+  'uk': { label: 'Українська', pkg: 'dictionary-uk' },
   'sv': { label: 'Svenska', pkg: 'dictionary-sv' },
+  'da': { label: 'Dansk', pkg: 'dictionary-da' },
   'el': { label: 'Ελληνικά', pkg: 'dictionary-el' }
 };
 
@@ -2739,11 +3055,13 @@ function buildMenu() {
         {
           visible: !scriptState.on,
           label: t('Drop Cap Style'),
+          // one radio group, so no separator before Off: Electron starts a new group at a
+          // separator and ticks the first item of a group with nothing checked, so Off on its
+          // own was ticked beside the style in use (#422)
           submenu: [
             { label: t('Literary'), type: 'radio', checked: viewState.dropCap === 'literary', click: () => sendToWindow({ type: 'dropCap', value: 'literary' }) },
             { label: t('Fantasy'), type: 'radio', checked: viewState.dropCap === 'fantasy', click: () => sendToWindow({ type: 'dropCap', value: 'fantasy' }) },
             { label: t('Sci-Fi'), type: 'radio', checked: viewState.dropCap === 'scifi', click: () => sendToWindow({ type: 'dropCap', value: 'scifi' }) },
-            { type: 'separator' },
             { label: t('Off'), type: 'radio', checked: viewState.dropCap === 'none', click: () => sendToWindow({ type: 'dropCap', value: 'none' }) }
           ]
         },
@@ -2900,7 +3218,6 @@ function buildMenu() {
           ]
         },
         {
-          more: true,
           label: t('Brighter Interface'),
           type: 'checkbox',
           checked: viewState.uiBright,
@@ -2948,6 +3265,10 @@ function buildMenu() {
         {
           label: t('NEO Shortcuts'),
           click: () => sendToWindow({ type: 'help' })
+        },
+        {
+          label: t('NEO for iPad and iPhone…'),
+          click: () => { showPocketInfo().catch((err) => logError('pocket info', err)); }
         },
         { type: 'separator' },
         {
@@ -3147,7 +3468,9 @@ let updaterReady = false;    // an update is downloaded and waiting
 // where the background download stands, so the window can pick it up mid-way
 const upd = { state: 'idle', version: '', percent: 0, transferred: 0, total: 0, message: '' };
 function getUpdater() {
-  if (updater || !app.isPackaged) return updater;
+  // (electron-builder's portable launcher sets PORTABLE_EXECUTABLE_FILE: there
+  // the updater would install the setup program on quit, #479)
+  if (updater || !app.isPackaged || process.env.PORTABLE_EXECUTABLE_FILE) return updater;
   const { autoUpdater } = require('electron-updater');
   autoUpdater.logger = null;
   autoUpdater.autoDownload = true;       // found it? fetch it — nobody should have to ask
@@ -3174,6 +3497,15 @@ function getUpdater() {
   });
   updater = autoUpdater;
   return updater;
+}
+
+// Windows shutting down (or the writer signing out) quits NEO too, and an
+// update installed then is cut off halfway: the old NEO already removed, the
+// new one never in, and the next morning NEO is gone from the PC (#490). So
+// a quit that Windows started leaves the update waiting for the writer's own
+// next quit, or for Restart to update.
+function holdUpdateForShutdown() {
+  if (updater) updater.autoInstallOnAppQuit = false;
 }
 
 // one look at GitHub; if something newer is there, the download starts on
@@ -3341,6 +3673,9 @@ app.whenReady().then(() => {
     try { ensureLibrary(); } catch (err) { logError('library', err); }
     createWindow();
     try { announceLibraryFallback(); } catch (err) { logError('library notice', err); }
+    // NEO Pocket's folder may be here already, or arrive while NEO is open
+    setTimeout(() => { askAboutPocket().catch((err) => logError('pocket ask', err)); }, 2500).unref?.();
+    app.on('browser-window-focus', () => { askAboutPocket().catch((err) => logError('pocket ask', err)); });
     try { initSpell(); } catch (err) { logError('spell', err); }
     try { buildMenu(); } catch (err) { logError('menu', err); }
     // the day's backup waits until NEO is up and the writer is writing (it
@@ -3365,5 +3700,6 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
+  // (moving the library closes the window on purpose, then restarts NEO itself)
+  if (process.platform !== 'darwin' && !movingLibrary) app.quit();
 });
