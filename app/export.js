@@ -33,12 +33,16 @@ function parasFromHtml(html, { blanks = false } = {}) {
     const sceneBreak = p.classList.contains('scene-break');
     // a LitRPG box line: its spaces are the writer's (columns), so they stay
     const litrpg = !sceneBreak && p.classList.contains('litrpg');
-    const poetry = !litrpg && p.classList.contains('poetry');
-    const flush = !poetry && !litrpg && p.classList.contains('flush');
+    const code = !sceneBreak && !litrpg && p.classList.contains('code');
+    const poetry = !litrpg && !code && p.classList.contains('poetry');
+    const flush = !poetry && !litrpg && !code && p.classList.contains('flush');
     const align = litrpg ? '' : (p.style && p.style.textAlign) || '';
     const runs = paraRuns(p.innerHTML, !litrpg).filter((r) => r.text || r.fn !== undefined);
     const inner = runs.map((r) => runHtml(litrpg && r.text ? { ...r, text: litrpgSpaces(r.text) } : r)).join('');
     p.querySelectorAll('.fn').forEach((f) => f.remove());
+    // a line of code keeps its leading spaces, and an empty one stays: it's
+    // a blank line inside the block
+    if (code) return { sceneBreak: false, poetry: false, flush: false, litrpg: false, code: true, text: p.textContent, runs, align: '', html: `<p class="code">${inner}</p>` };
     healStrayNbsp(p);
     return {
       sceneBreak,
@@ -53,7 +57,7 @@ function parasFromHtml(html, { blanks = false } = {}) {
   });
   // an empty line inside a box is a blank line in it; at a box's edge, or
   // as the whole box, it's nothing
-  const has = (p) => p && (p.sceneBreak || p.text);
+  const has = (p) => p && (p.sceneBreak || p.code || p.text);
   const kept = paras.filter((p, i) => {
     if (has(p)) return true;
     if (!p.litrpg) {
@@ -170,7 +174,8 @@ function manuscriptSections() {
   const { sections } = exportChapters();
   return sections.filter((s) => s.kind === 'chapter' || s.kind === 'part' || s.kind === 'epigraph').map((s) => ({
     kind: s.kind, heading: s.heading || '', partTitle: s.partTitle || '',
-    paras: s.paras.map((p) => ({ sceneBreak: p.sceneBreak, blank: !!p.blank, poetry: p.poetry, flush: p.flush, litrpg: !!p.litrpg, align: p.align, runs: p.runs || [] })),
+    paras: s.paras.map((p) => ({ sceneBreak: p.sceneBreak, blank: !!p.blank, poetry: p.poetry, flush: p.flush, litrpg: !!p.litrpg, align: p.align,
+      code: p.code, text: p.code ? p.text : undefined, runs: p.code ? [{ text: p.text }] : p.runs || [] })),
     words: s.paras.reduce((n, p) => n + (p.sceneBreak ? 0 : countWords(p.text || '')), 0)
   }));
 }
@@ -209,7 +214,11 @@ function manuscriptModel(v, sections) {
     font: v.font, paper: window.neo.paper || 'Letter', lang: writingLanguage(),
     // one story with no chapters: the short-story layout
     short: sections.length === 1 && chapters.length === 1 && !chapters[0].heading,
-    sections, words
+    // each formula carried set, for the page (MathML) and for Word (OMML)
+    sections: sections.map((s) => ({ ...s, paras: (s.paras || []).map((x) => (x.runs && x.runs.some((r) => r.m)
+      ? { ...x, runs: x.runs.map((r) => (r.m ? { ...r, mathml: mathMarkup(r.text) || '', omml: ommlOf(r.text) || '' } : r)) }
+      : x)) })),
+    words
   };
 }
 // Courier Prime (NEO's own Courier, bundled) goes into the PDF; Times New

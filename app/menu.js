@@ -326,6 +326,10 @@ function bookShortcutSections() {
       [['[['], tk('At the start of a line: a LitRPG box'), tk('For rolls, stats and system messages. Enter on an empty last line ends the box; ⇧Enter adds a blank line inside it.')],
       [KPH, tk('Insert a placeholder note')],
       ...(on('footnotes') ? [[KFN, tk('Add a footnote'), tk('Type the note, then Enter to go back to writing. Click its number to change it.')]] : []),
+      ...(on('codeMaths') ? [
+        [[KCODE, '```'], tk('Start or leave a code block'), tk('Type ``` alone on a line, then Enter, to start one. Each Enter is a new line of code; Enter on an empty last line, or Esc, goes back to prose.')],
+        [[KMATH, '$…$'], tk('Maths, set on a line of its own'), tk('Type $ around the formula, in AsciiMath (sum_(k=1)^n k) or LaTeX (\\frac{a}{b}), or select it and press the keys. Click it, or Backspace just after it, to edit it.')]
+      ] : []),
       [KDA, tk('Move selected text to Darlings')],
       ...(on('readAloud') ? [[K('⌘⇧U', IS_LINUX ? 'Ctrl+Shift+K' : 'Ctrl+Shift+U'), tk('Read aloud from the cursor'), tk('Again, Esc or any key stops it. Uses your computer’s own voice.')]] : [])
     ] },

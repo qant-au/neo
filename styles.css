@@ -920,6 +920,31 @@ body.paged #paper:not(.script) #tp-author { font-size: calc(14px * var(--page-zo
 .chapter-body i i i { font-style: italic; }
 .chapter-body p:not(.poetry) + p.poetry { margin-top: 0.9em; }
 .chapter-body p.poetry + p:not(.poetry) { margin-top: 0.9em; }
+/* Code blocks (⌘⇧B, or ``` then Enter): one p.code per line, monospaced,
+   every space kept, no shading: a book page, not a code editor. Set in at
+   the paragraph indent (2em of the prose, in the code's smaller em), where
+   the words of the chapter's opening paragraph start beside its drop cap.
+   A run of lines breathes above and below. */
+.chapter-body p.code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.82em; line-height: 1.55; text-indent: 0 !important; margin: 0 0 0 calc(2em / 0.82);
+  white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; tab-size: 2;
+}
+/* a block straight after the chapter's opening paragraph, while its drop
+   cap is set, starts where that paragraph's words do beside the cap: --cap-in
+   is that offset in ems of the prose, measured by app/code.js (capIndent) */
+body:not(.no-dropcap) .chapter-body.has-cap:not(.no-cap):not(.opens-dialogue) p[data-first] ~ p.code:not(p[data-first] ~ p:not(.code) ~ p.code) {
+  margin-left: calc(var(--cap-in, 2) * 1em / 0.82);
+}
+.chapter-body p.code:not(p.code + p.code) { margin-top: 0.9em; }
+.chapter-body p.code:not(:has(+ p.code)) { margin-bottom: 0.9em; }
+/* Maths (⌘⇧M, or $…$): the formula typeset (app/code.js sets it from the span's
+   text, in a shadow root: a full-width box, then a gap the paragraph
+   indent wide), centred on a line of its own, the sentence carrying on
+   below it at the indent; the caret steps over it whole, a click opens it.
+   Inline boxes, not a block: to the editor it stays one piece of the
+   sentence, so the caret and typing keep their places */
+.chapter-body .math { cursor: text; }
 /* LitRPG boxes ([[ at the start of a line): the game talking — a roll, a
    level-up, a character sheet. IBM Plex Mono (bundled in fonts/, OFL) so columns line
    up, every space kept (pre-wrap, as all prose here), on a light wash of the

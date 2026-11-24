@@ -77,7 +77,7 @@ function dropJunkSpans(html) {
   const junk = [];
   return html.replace(/<span\b[^>]*>|<\/span>/g, (tag) => {
     if (tag[1] === '/') return junk.pop() ? '' : tag;
-    const drop = !/\sclass="[^"]*\b(?:ph-mark|fn)\b/.test(tag);
+    const drop = !/\sclass="[^"]*\b(?:ph-mark|fn|math)\b/.test(tag);
     junk.push(drop);
     return drop ? '' : tag;
   });
@@ -94,7 +94,7 @@ const OPENING_DASH = /^\s*[-‐‑‒–—―]/;
 // chapter it's the paragraph waiting for the first word. Marked data-first,
 // for the screen only.
 function openingPara(body) {
-  const ps = [...body.children].filter((p) => p.tagName === 'P' && !p.classList.contains('poetry') && !p.classList.contains('litrpg') && !p.classList.contains('scene-break') && !p.classList.contains('ghost'));
+  const ps = [...body.children].filter((p) => p.tagName === 'P' && !p.classList.contains('poetry') && !p.classList.contains('litrpg') && !p.classList.contains('code') && !p.classList.contains('scene-break') && !p.classList.contains('ghost'));
   return ps.find((p) => p.textContent.trim() !== '') || ps[0] || null;
 }
 function markDialogueOpening(body) {
@@ -759,6 +759,9 @@ function smartKeys(e, body) {
   // a field can reach smartKeys twice (its own handler and the page-wide
   // one below): the first pass wins
   if (e.defaultPrevented) return;
+  // code and maths are typed exactly: no dashes, capitals, quotes or Markdown
+  const here = window.getSelection();
+  if (here && here.rangeCount && caretInCode(here.getRangeAt(0).startContainer)) return;
   if (litrpgKey(e, body)) return;
   dialogueDashKey(e, body);
   autoCapKey(e, body);
@@ -777,6 +780,7 @@ function smartKeys(e, body) {
     return node.textContent.slice(Math.max(0, range.startOffset - n), range.startOffset);
   };
 
+  if (markdownMath(e, body, range)) return;
   if (markdownEmphasis(e, body, range)) return;
   // German sets its dash as an en dash – like this –, so there -- makes
   // one, and a third hyphen the em dash (#286). A script keeps -- and ...
@@ -1168,6 +1172,15 @@ document.addEventListener('keydown', (e) => {
   if (cmd && e.shiftKey && keyLetter(e) === 'd') {
     e.preventDefault();
     if (currentTab === 'manuscript') darlingFromKeyboard();
+  }
+  // ⌘⇧B a code block, ⌘⇧M inline maths (CODE BLOCKS)
+  if (cmd && e.shiftKey && !e.altKey && keyLetter(e) === 'b') {
+    e.preventDefault();
+    if (currentTab === 'manuscript' && featureOn('codeMaths')) toggleCode();
+  }
+  if (cmd && e.shiftKey && !e.altKey && keyLetter(e) === 'm') {
+    e.preventDefault();
+    if (currentTab === 'manuscript' && featureOn('codeMaths')) insertMath();
   }
   if (cmd && e.shiftKey && !e.altKey && keyLetter(e) === 'n') {
     e.preventDefault();

@@ -298,6 +298,7 @@ const FEATURES = [
   { key: 'notesPages', label: tk('Chapter notes pages'), desc: tk('A notes page for each chapter, beside the book’s own.'), pocket: true },
   { key: 'poetry', label: tk('Poetry paragraphs'), desc: tk('Lines set in from the margins, in italic.'), pocket: true },
   { key: 'footnotes', label: tk('Footnotes'), desc: tk('Numbered notes at the foot of the page.'), pocket: true },
+  { key: 'codeMaths', label: tk('Code blocks and maths'), desc: tk('Lines of code set as typed, and formulas typeset from AsciiMath or LaTeX.'), pocket: false },
   { key: 'formatting', label: tk('Alignment and other fonts'), desc: tk('Center, right-align or justify paragraphs or the whole book, and use any font on your computer.'), pocket: false },
   { key: 'penNames', label: tk('Pen names and bound shelves'), desc: tk('Shelves under other names, a shelf bound into one book, anthologies, Duplicate and Reshelve.'), pocket: true },
   { key: 'covers', label: tk('Painted covers'), desc: tk('Covers painted from your story with your own OpenAI key.'), pocket: false },
@@ -623,7 +624,7 @@ function countWords(text) {
 // A copy of a chapter without the marks that aren't words. A chapter on the
 // page is copied node for node: writing it out as HTML and reading it back
 // costs twice as much and gives the same tree.
-const UNCOUNTED = '.darling-anchor, .ph-mark, .ghost, .fn';
+const UNCOUNTED = '.darling-anchor, .ph-mark, .ghost, .fn, .math';
 function cleanChapterEl(id) {
   const el = document.querySelector(`.chapter[data-id="${id}"] .chapter-body`);
   let holder;

@@ -102,6 +102,29 @@
     return `<w:p>${pPr.length ? '<w:pPr>' + pPr.join('') + '</w:pPr>' : ''}${runsXml(runs)}</w:p>`;
   }
   const plainRun = (text) => [{ text }];
+  // A paragraph with maths in it (a run with omml, the formula as a Word
+  // equation): each formula centred on a line of its own, as on the page,
+  // the words after it carrying on below at the paragraph's indent
+  function withMaths(runs, o) {
+    if (!(runs || []).some((r) => r.omml)) return [p(runs, o)];
+    const out = [];
+    let words = [];
+    let opts = o;
+    const flush = () => {
+      // the words after an equation start their line: no space in front
+      if (out.length && words[0] && words[0].text) words[0] = { ...words[0], text: words[0].text.replace(/^\s+/, '') };
+      if (words.some((r) => (r.text && r.text.trim()) || r.fn !== undefined)) { out.push(p(words, opts)); opts = { ...opts, pageBreak: false }; }
+      words = [];
+    };
+    for (const r of runs) {
+      if (!r.omml) { words.push(r); continue; }
+      flush();
+      out.push(`<w:p><w:pPr><w:pStyle w:val="ManuscriptNoIndent"/>${opts.pageBreak ? '<w:pageBreakBefore/>' : ''}<w:jc w:val="center"/></w:pPr><m:oMathPara>${r.omml}</m:oMathPara></w:p>`);
+      opts = { ...o, pageBreak: false };
+    }
+    flush();
+    return out;
+  }
 
   // The page a section is set on: one-inch margins, the header half an
   // inch from the top
@@ -169,9 +192,10 @@
             return;
           }
           if (x.sceneBreak) out.push(p(plainRun('#'), { style: 'SceneBreak', pageBreak }));
+          else if (x.code) out.push(p(x.text ? plainRun(x.text) : [], { style: 'Code', pageBreak }));
           else if (x.poetry) out.push(p(x.runs, { style: 'Poetry', pageBreak, align: x.align === 'center' || x.align === 'right' ? x.align : '' }));
           else if (x.align === 'center' || x.align === 'right') out.push(p(x.runs, { style: 'Centered', pageBreak, align: x.align === 'right' ? 'right' : '' }));
-          else out.push(p(x.runs, { style: x.flush ? 'ManuscriptNoIndent' : 'Manuscript', pageBreak }));
+          else out.push(...withMaths(x.runs, { style: x.flush ? 'ManuscriptNoIndent' : 'Manuscript', pageBreak }));
         });
         if (lead) out.push(p([], { pageBreak: true }));
       }
@@ -205,6 +229,7 @@
 <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style>
 ${para('Manuscript', 'Manuscript Text', `<w:ind w:firstLine="${TWIP / 2}"/>`)}
 ${para('ManuscriptNoIndent', 'Manuscript Text No Indent', '')}
+${para('Code', 'Code', `<w:ind w:left="${TWIP / 2}"/>`, '<w:rFonts w:ascii="Courier New" w:hAnsi="Courier New" w:cs="Courier New"/>')}
 ${para('Poetry', 'Poetry', `<w:ind w:left="${TWIP / 2}" w:right="${TWIP / 2}"/>`)}
 ${para('LitRPG', 'LitRPG', ['top', 'left', 'bottom', 'right'].map((side) => `<w:${side} w:val="single" w:sz="4" w:space="${side === 'top' || side === 'bottom' ? 4 : 6}" w:color="999999"/>`).join('').replace(/^/, '<w:pBdr>') + '</w:pBdr><w:shd w:val="clear" w:color="auto" w:fill="EDEDED"/><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>' + `<w:ind w:left="${TWIP / 2}" w:right="${TWIP / 2}"/>`, '<w:rFonts w:ascii="Courier New" w:hAnsi="Courier New" w:eastAsia="Courier New" w:cs="Courier New"/>')}
 ${para('Centered', 'Centered', '<w:jc w:val="center"/>')}
@@ -243,7 +268,7 @@ ${chr('FootnoteReference', 'footnote reference', '<w:vertAlign w:val="superscrip
     try { return docxParts(m); } finally { notes = null; }
   }
   function docxParts(m) {
-    const NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
+    const NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"';
     let body;
     if (m.short) {
       const story = storyBlocks(m);
@@ -295,10 +320,14 @@ ${headers.map((h) => `<Relationship Id="${h.id}" Type="http://schemas.openxmlfor
   // counter gave every note on a page that page's last number)
   let fnCount = 0;
   function runsHtml(runs) {
-    return (runs || []).map((r) => {
+    return (runs || []).map((r, i) => {
       if (r.br) return '<br>';
       // a footnote: Paged.js sets it at the foot of its page
       if (r.fn !== undefined) { fnCount += 1; return `<sup class="fncall">${fnCount}</sup><span class="footnote">${fnCount}. ${escHtml(r.fn)}</span>`; }
+      // a formula, set (MathML), centred on a line of its own, the words
+      // after it opening their line at the indent (.mgap)
+      if (r.mathml) return r.mathml + (runs.slice(i + 1).some((q) => (q.text && q.text.trim()) || q.fn !== undefined) ? '<span class="mgap"></span>' : '');
+      if (i && runs[i - 1].mathml && r.text) r = { ...r, text: r.text.replace(/^[ \t]+/, '') };
       let t = escHtml(r.text);
       if (r.s) t = '<s>' + t + '</s>';
       if (r.u) t = '<u>' + t + '</u>';
@@ -341,6 +370,7 @@ ${headers.map((h) => `<Relationship Id="${h.id}" Type="http://schemas.openxmlfor
             const edge = [list[i - 1] && list[i - 1].litrpg ? '' : 'lt-top', list[i + 1] && list[i + 1].litrpg ? '' : 'lt-end'].filter(Boolean).join(' ');
             return `<p class="litrpg${edge ? ' ' + edge : ''}">${runsHtml(boxSpaces(x.runs)) || '&#8203;'}</p>`;
           }
+          if (x.code) return `<p class="code">${escHtml(x.text || '') || '<br>'}</p>`;
           const c = x.poetry ? 'poetry' : x.align === 'center' ? 'c' : x.align === 'right' ? 'r' : x.flush ? 'flush' : '';
           return `<p${c ? ` class="${c}"` : ''}>${runsHtml(x.runs)}</p>`;
         }).join('\n');
@@ -370,6 +400,10 @@ p.flush, p.c, p.r, p.brk, p.end, p.poetry { text-indent: 0; }
 p.c, p.brk, p.end { text-align: center; }
 p.r { text-align: right; }
 p.poetry { margin: 0 0.5in; }
+p.code { text-indent: 0; margin-left: 0.5in; white-space: pre-wrap; overflow-wrap: anywhere; font-family: "Courier Prime", "Courier New", Cousine, "Liberation Mono", Courier, monospace; }
+math { display: block math; text-align: center; text-indent: 0; font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; }
+.mgap { display: inline-block; width: 0.5in; }
+p.flush .mgap, p.c .mgap, p.r .mgap, p.poetry .mgap { display: none; }
 p.litrpg { font-family: "Courier Prime", "Courier New", monospace; line-height: 1.2; text-indent: 0; white-space: pre-wrap; margin: 0 0.5in; padding: 0 0.1in; background: #ededed; border-left: 0.75pt solid #999; border-right: 0.75pt solid #999; -webkit-print-color-adjust: exact; print-color-adjust: exact; break-inside: avoid; }
 p.litrpg.lt-top { margin-top: 1em; padding-top: 0.3em; border-top: 0.75pt solid #999; }
 p.litrpg.lt-end { margin-bottom: 1em; padding-bottom: 0.3em; border-bottom: 0.75pt solid #999; }

@@ -40,7 +40,7 @@ async function spellScanEl(el, key) {
   let n;
   while ((n = walker.nextNode())) {
     const p = n.parentElement;
-    if (p && p.closest('.scene-break, .ghost, .ph-mark')) continue;
+    if (p && p.closest('.scene-break, .ghost, .ph-mark, .code, .math')) continue;
     let m;
     re.lastIndex = 0;
     while ((m = re.exec(n.data))) {

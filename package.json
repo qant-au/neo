@@ -13,6 +13,7 @@
     "test:tabs": "electron scripts/tabs.e2e.js",
     "test:notes": "electron scripts/notes.e2e.js",
     "test:footnotes": "electron scripts/footnotes.e2e.js",
+    "test:code-math": "electron scripts/code-math.e2e.js",
     "test:cover-text": "electron scripts/cover-text.e2e.js",
     "test:caret": "electron scripts/caret.e2e.js",
     "test:dropcap": "electron scripts/dropcap.e2e.js",
@@ -170,6 +171,7 @@
   },
   "dependencies": {
     "@farscrl/hunspell-wasm": "1.0.1",
+    "asciimath2tex": "^1.5.0",
     "dictionary-da": "file:dictionaries/da",
     "dictionary-de": "^3.0.0",
     "dictionary-el": "^4.0.0",
@@ -189,7 +191,8 @@
     "dictionary-uk": "file:dictionaries/uk",
     "electron-updater": "^6.3.9",
     "jszip": "^3.10.1",
-    "koffi": "2.16.3"
+    "koffi": "2.16.3",
+    "temml": "^0.14.0"
   },
   "allowScripts": {
     "electron@33.4.11": true

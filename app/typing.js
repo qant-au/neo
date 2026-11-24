@@ -98,6 +98,13 @@ function wireChapterBody(body, chId) {
     // into a LitRPG box: line for line, every space kept
     const into = caretBlock(body);
     if (into && into.classList.contains('litrpg')) { pasteIntoBox(body, chId, html, text); return; }
+    // into a line of code: the text as it was, line for line
+    if (isCode(into)) {
+      const holder = document.createElement('div');
+      if (!text && html) holder.innerHTML = html;
+      pasteIntoCode(body, chId, text || holder.innerText || '');
+      return;
+    }
     // a box copied from NEO stays a box
     if (html && /<p\b[^>]*\bclass="[^"]*\blitrpg\b/.test(html) && pasteBoxesFromNeo(body, chId, html)) {
       reconcileMarks();
@@ -109,7 +116,7 @@ function wireChapterBody(body, chId) {
     if (html) {
       document.execCommand('insertHTML', false, cleanPasteHtml(html, { style: dashStyle(), quotes, ...edges }));
       // the engine wraps inserted HTML (and its neighbours) in style spans
-      if (body.querySelector('span:not(.ph-mark):not(.fn)')) {
+      if (body.querySelector('span:not(.ph-mark):not(.fn):not(.math)')) {
         const caret = captureCaret();
         stripJunkSpans(body);
         restoreCaret(caret);
@@ -186,6 +193,9 @@ function wireChapterBody(body, chId) {
     }
     if (litrpgEnter(e, body, chId)) return;
     if (litrpgBackspace(e, body, chId)) return;
+    if (handleCode(e, body, chId)) return;
+    if (codeFenceEnter(e, body, chId)) return;
+    if (mathBackspace(e, body, chId)) return;
     if (handlePoetry(e, body, chId)) return;
     if (handleFlush(e, body, chId)) return;
     if (poetryBackspace(e, body, chId)) return;
@@ -206,6 +216,9 @@ function wireChapterBody(body, chId) {
     if (mark) focusSticky(mark.dataset.sid);
     const fn = e.target.closest('.fn');
     if (fn) openFootnote(fn);
+    // a click on a formula opens it to edit, the closing $ sets it again
+    const math = e.target.closest('.math');
+    if (math && body.contains(math)) openMathAtEnd(math, body, chId);
     // clicking a ghost outline note selects it, ready to be replaced with prose
     const ghost = e.target.closest('p.ghost');
     if (ghost) {
@@ -224,6 +237,7 @@ function wireChapterBody(body, chId) {
     if (isScript()) { e.preventDefault(); return; } // a script's lines are its elements
     const key = { key: 'Enter', shiftKey: true, metaKey: false, ctrlKey: false, altKey: false, preventDefault: () => e.preventDefault() };
     if (litrpgEnter(key, body, chId)) return;
+    if (handleCode(key, body, chId)) return; // in code: the next line of it
     if (!handlePoetry(key, body, chId)) handleFlush(key, body, chId);
   });
   // the moment writing hits a ghost, it becomes prose
@@ -885,7 +899,7 @@ function guardMarkerDelete(e, body, chId) {
 // ("<span style='text-indent...'>"). They corrupt later edits — unwrap them,
 // keeping only NEO's own marks.
 function stripJunkSpans(el) {
-  for (const s of [...el.querySelectorAll('span:not(.ph-mark):not(.fn)')]) {
+  for (const s of [...el.querySelectorAll('span:not(.ph-mark):not(.fn):not(.math)')]) {
     while (s.firstChild) s.before(s.firstChild);
     s.remove();
   }
@@ -958,7 +972,7 @@ function handleEnter(e, body, chId) {
   if (!isStory(chId) && !block.classList.contains('poetry')) {
     e.preventDefault();
     enterRun = 0;
-    if (block.querySelector('span:not(.ph-mark):not(.fn)')) {
+    if (block.querySelector('span:not(.ph-mark):not(.fn):not(.math)')) {
       const caret = captureCaret();
       stripJunkSpans(block);
       restoreCaret(caret);
@@ -1051,7 +1065,7 @@ function handleEnter(e, body, chId) {
     // make the engine clone whole paragraphs) are stripped first if present
     e.preventDefault();
     caretOffFootnote(sel);
-    if (block.querySelector('span:not(.ph-mark):not(.fn)')) {
+    if (block.querySelector('span:not(.ph-mark):not(.fn):not(.math)')) {
       // Unwrapping moves text nodes, so preserve the caret's text position.
       const caret = captureCaret();
       stripJunkSpans(block);

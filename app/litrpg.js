@@ -71,7 +71,7 @@ function litrpgEnter(e, body, chId) {
     breakRun++;
     return true;
   }
-  if (block.querySelector('span:not(.ph-mark):not(.fn)')) stripJunkSpans(block);
+  if (block.querySelector('span:not(.ph-mark):not(.fn):not(.math)')) stripJunkSpans(block);
   // the engine's own split, so ⌘Z sees it
   document.execCommand('insertParagraph');
   const cur = caretBlock(body);
@@ -177,7 +177,7 @@ function pasteIntoBox(body, chId, html, text) {
     }
     if (line) document.execCommand('insertText', false, line);
   });
-  if (body.querySelector('span:not(.ph-mark):not(.fn)')) {
+  if (body.querySelector('span:not(.ph-mark):not(.fn):not(.math)')) {
     const caret = captureCaret();
     stripJunkSpans(body);
     restoreCaret(caret);

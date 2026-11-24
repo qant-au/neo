@@ -26,7 +26,7 @@ function caretOffFootnote(sel) {
   const node = r.startContainer;
   if (node.nodeType !== Node.ELEMENT_NODE) return;
   const before = node.childNodes[r.startOffset - 1];
-  if (!before || !before.classList || !before.classList.contains('fn')) return;
+  if (!before || !before.classList || !(before.classList.contains('fn') || before.classList.contains('math'))) return;
   let next = before.nextSibling;
   if (!next || next.nodeType !== Node.TEXT_NODE) {
     next = document.createTextNode('');

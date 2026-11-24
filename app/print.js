@@ -65,14 +65,20 @@ function buildPrintHtml(d, o) {
   const prose = (paras, opening) => {
     let first = opening;
     let afterBreak = false;
+    let capRun = ''; // the opening paragraph's drop cap, for code set straight after it
     return paras.map((p, i) => {
+      if (!p.code) capRun = '';
       if (p.sceneBreak) { afterBreak = true; return '<p class="brk">*&#8195;*&#8195;*</p>'; }
       if (p.blank) return '<p class="blank">&#160;</p>';
       const inner = atFoot(p.html.replace(/^<p[^>]*>|<\/p>$/g, ''), p);
       if (p.litrpg) { afterBreak = false; return `<p class="${litrpgClass(paras, i)}">${inner || '&#8203;'}</p>`; }
       if (p.poetry) { afterBreak = false; return `<p class="poetry"${p.align ? ` style="text-align:${p.align}"` : ''}>${inner}</p>`; }
+      // a code block's first and last lines marked, for the space around it
+      // (Paged.js sets no sibling rule there)
+      if (p.code) return capCode(`<p class="code${paras[i - 1] && paras[i - 1].code ? '' : ' top'}${paras[i + 1] && paras[i + 1].code ? '' : ' end'}">${inner}</p>`, capRun);
       const cls = ['hy'];
       if (first) cls.push('first');
+      if (first && cap && !OPENING_DASH.test(p.text)) capRun = capLetter(p.text);
       if (first && OPENING_DASH.test(p.text)) cls.push('dialogue');
       if (afterBreak || p.flush) cls.push('flush');
       first = false;
@@ -82,6 +88,7 @@ function buildPrintHtml(d, o) {
   };
   const lines = (paras) => paras.map((p) => {
     if (p.sceneBreak) return '<p class="brk">*&#8195;*&#8195;*</p>';
+    if (p.code) return p.html;
     const cls = [isAttribution(p) ? 'attr' : '', p.poetry ? 'poetry' : ''].filter(Boolean).join(' ');
     return `<p${cls ? ` class="${cls}"` : ''}>${atFoot(p.html.replace(/^<p[^>]*>|<\/p>$/g, ''), p)}</p>`;
   }).join('\n');
@@ -175,6 +182,7 @@ function buildPrintHtml(d, o) {
   }
   body += back.map((x, i) => (i ? x.replace('class="backpage', 'class="backpage run-on') : x)).join('\n');
 
+  body = mathGaps(typesetMathHtml(body));
   const sz = trim.size;
   return `<!DOCTYPE html>
 <html lang="${esc(d.language || writingLanguage())}"><head><meta charset="utf-8"><title>${esc(d.title)}</title>
@@ -239,10 +247,22 @@ p { margin: 0; orphans: 2; widows: 2; }
 .ch-title.ch-only { font-size: ${(sz * 1.35).toFixed(1)}pt; letter-spacing: 0.06em; }
 p.hy { text-align: justify; text-indent: 1.5em; hyphens: manual; -webkit-hyphens: manual; text-wrap: pretty; }
 p.hy.first, p.hy.flush { text-indent: 0; }
-${cap ? `p.first:not(.dialogue)::first-letter { initial-letter: ${DROP_CAP_SIZE}; -webkit-initial-letter: ${DROP_CAP_SIZE}; font-family: ${cap}; padding-right: 0.06em; }` : ''}
+${cap ? `p.first:not(.dialogue)::first-letter, p.first:not(.dialogue) .mgap.cap::first-letter { initial-letter: ${DROP_CAP_SIZE}; -webkit-initial-letter: ${DROP_CAP_SIZE}; font-family: ${cap}; padding-right: 0.06em; }
+p.first:not(.dialogue) .mgap.cap { width: auto; }
+p.code.capped { display: flex; margin-left: 0; }
+p.code.capped .mgap.cap { display: block; flex: none; width: auto; font-family: ${exportBodyFont()}; font-size: calc(1em / 0.8); line-height: 1.42; }
+p.code.capped .mgap.cap::first-letter { initial-letter: ${DROP_CAP_SIZE}; -webkit-initial-letter: ${DROP_CAP_SIZE}; font-family: ${cap}; padding-right: 0.06em; }` : ''}
 p.brk { text-align: center; margin: 0.7em 0; break-after: avoid; letter-spacing: 0.1em; }
 p.poetry { margin: 0.5em 1.5em; text-align: left; }
 p.poetry + p.poetry { margin-top: 0; }
+p.code { font-family: "Courier Prime", "Courier New", monospace; font-size: 0.8em; line-height: 1.4; text-indent: 0; text-align: left; margin: 0 0 0 calc(1.5em / 0.8); white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; }
+p.code.top { margin-top: 0.7em; }
+p.code.end { margin-bottom: 0.7em; }
+math { display: block math; text-align: center; text-indent: 0; margin: 0.45em 0; font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; }
+.mgap { display: inline-block; width: 1.5em; }
+.mgap.cap { height: 0; overflow: hidden; visibility: hidden; vertical-align: baseline; }
+.mgap.cap::before { content: attr(data-cap); }
+p.flush .mgap, p.poetry .mgap, p[style*="text-align"] .mgap { display: none; }
 ${litrpgCss('p.litrpg', { size: '0.78em', side: '0.15in', pad: '0.12in', fill: '#ebebeb', line: '#9a9a9a', gap: '1.3em' })}
 .backpage p.hy { text-indent: 0; margin-bottom: 0.7em; }
 .also p { text-align: center; font-style: italic; margin: 0 0 0.45em; }
@@ -451,8 +471,12 @@ function buildTxt(data) {
         out += p.text + '\n' + (ch.paras[i + 1] && ch.paras[i + 1].litrpg ? '' : '\n');
         return;
       }
-      const noted = (p.runs || []).some((r) => r.fn !== undefined);
-      const text = noted ? p.runs.map((r) => (r.fn !== undefined ? (notes.push(r.fn), `[${++fnN}]`) : r.text)).join('').trim() : p.text;
+      if (p.code) {
+        out += '    ' + p.text + '\n' + (ch.paras[i + 1] && ch.paras[i + 1].code ? '' : '\n');
+        return;
+      }
+      const noted = (p.runs || []).some((r) => r.fn !== undefined || r.m);
+      const text = noted ? p.runs.map((r) => (r.fn !== undefined ? (notes.push(r.fn), `[${++fnN}]`) : r.m ? `$${r.text}$` : r.text)).join('').trim() : p.text;
       out += p.sceneBreak ? '\n***\n\n' : (p.poetry ? '    ' : '') + text + '\n\n';
     });
     if (notes.length) out += '----------\n' + notes.map((n, i) => `[${fnN - notes.length + i + 1}] ${n}`).join('\n') + '\n\n';
@@ -486,8 +510,16 @@ function buildMd(data) {
         out += (top ? '```\n' : '') + p.text + '\n' + (end ? '```\n\n' : '');
         return;
       }
-      const runs = (p.runs || []).map((r) => (r.fn !== undefined ? (notes.push(r.fn), { text: '\uE001' + (++fnN) + '\uE002' }) : r));
-      out += p.sceneBreak ? '\n***\n\n' : (p.poetry ? '> ' : '') + mdRuns(runs).replace(/\uE001(\d+)\uE002/g, '[^$1]') + '\n\n';
+      if (p.code) {
+        const prev = ch.paras[i - 1];
+        const next = ch.paras[i + 1];
+        out += (prev && prev.code ? '' : '```\n') + p.text + '\n' + (next && next.code ? '' : '```\n\n');
+        return;
+      }
+      const tex = [];
+      const runs = (p.runs || []).map((r) => (r.fn !== undefined ? (notes.push(r.fn), { text: '\uE001' + (++fnN) + '\uE002' })
+        : r.m ? (tex.push(r.text), { text: '\uE003' + (tex.length - 1) + '\uE004' }) : r));
+      out += p.sceneBreak ? '\n***\n\n' : (p.poetry ? '> ' : '') + mdRuns(runs).replace(/\uE001(\d+)\uE002/g, '[^$1]').replace(/\uE003(\d+)\uE004/g, (m, n) => '$' + tex[n] + '$') + '\n\n';
     });
     notes.forEach((n, i) => { out += `[^${fnN - notes.length + i + 1}]: ${mdMeta(n)}\n`; });
     if (notes.length) out += '\n';
@@ -577,11 +609,16 @@ function buildHtml(data, opts = {}) {
   const prose = (paras, initial) => {
     let first = initial;
     let afterBreak = false; // a story's line of speech after *** keeps its indent
+    let capRun = ''; // the opening paragraph's drop cap, for code set straight after it
+    const capped = (library.fonts || {}).dropcap !== 'none';
     return paras.map((p) => {
+      if (!p.code) capRun = '';
       if (p.sceneBreak) { afterBreak = initial; return '<p class="brk">***</p>'; }
       if (p.blank) return '<p class="blank">&#160;</p>';
       if (p.litrpg) { afterBreak = false; return `<p class="${litrpgClass(paras, paras.indexOf(p))}">${p.html.replace(/^<p[^>]*>|<\/p>$/g, '') || '&#8203;'}</p>`; }
       if (p.poetry) { afterBreak = false; return p.html; }
+      if (p.code) return capCode(p.html, capRun);
+      if (first && capped && !OPENING_DASH.test(p.text || '')) capRun = capLetter(p.text);
       let html = p.html;
       if (first || afterBreak) {
         const h = document.createElement('div');
@@ -600,6 +637,7 @@ function buildHtml(data, opts = {}) {
   // a page's lines, each set on its own
   const lines = (paras, attrs = true) => paras.map((p) => {
     if (p.sceneBreak) return '<p class="brk">***</p>';
+    if (p.code) return p.html;
     const cls = [attrs && isAttribution(p) ? 'attr' : '', p.poetry ? 'poetry' : ''].filter(Boolean).join(' ');
     return `<p${cls ? ` class="${cls}"` : ''}${p.align ? ` style="text-align:${p.align}"` : ''}>${p.html.replace(/^<p[^>]*>|<\/p>$/g, '')}</p>`;
   }).join('\n');
@@ -671,6 +709,7 @@ function buildHtml(data, opts = {}) {
     body += sectionHtml(ch);
   }
   if (!placed) body += contents;
+  body = mathGaps(typesetMathHtml(body));
   return `<!DOCTYPE html>
 <html lang="${escHtml(d.language || writingLanguage())}"><head><meta charset="utf-8"><title>${escHtml(d.title)}</title>
 <style>
@@ -698,11 +737,23 @@ function buildHtml(data, opts = {}) {
      search, and screen readers still find "The" where a float leaves "T"
      and "he" (a gap much wider than 4px splits the word again). A browser
      that can't set one gets a raised initial. */
-  ${(library.fonts || {}).dropcap === 'none' ? '' : `.chapter p.first:not(.dialogue)::first-letter { -webkit-initial-letter: ${DROP_CAP_SIZE}; initial-letter: ${DROP_CAP_SIZE}; padding-right: 4px; font-family: ${exportDropCapFont()}; }
-  @supports not ((initial-letter: 2) or (-webkit-initial-letter: 2)) { .chapter p.first:not(.dialogue)::first-letter { font-size: 1.8em; line-height: 1; padding-right: 0; } }`}
+  ${(library.fonts || {}).dropcap === 'none' ? '' : `.chapter p.first:not(.dialogue)::first-letter, .chapter p.first:not(.dialogue) .mgap.cap::first-letter { -webkit-initial-letter: ${DROP_CAP_SIZE}; initial-letter: ${DROP_CAP_SIZE}; padding-right: 4px; font-family: ${exportDropCapFont()}; }
+  .chapter p.first:not(.dialogue) .mgap.cap { width: auto; }
+  .chapter p.code.capped { display: flex; margin-left: 0; }
+  .chapter p.code.capped .mgap.cap { display: block; flex: none; width: auto; font-family: ${exportBodyFont()}; font-size: calc(1em / 0.82); line-height: 1.7; }
+  .chapter p.code.capped .mgap.cap::first-letter { -webkit-initial-letter: ${DROP_CAP_SIZE}; initial-letter: ${DROP_CAP_SIZE}; padding-right: 4px; font-family: ${exportDropCapFont()}; }
+  @supports not ((initial-letter: 2) or (-webkit-initial-letter: 2)) { .chapter p.first:not(.dialogue)::first-letter, .chapter p.first:not(.dialogue) .mgap.cap::first-letter { font-size: 1.8em; line-height: 1; padding-right: 0; } }`}
   .chapter .brk, .brk { text-align: center; text-indent: 0 !important; letter-spacing: 8px; color: #888; margin: 2.5em 0; }
   .chapter p.poetry { text-indent: 0; margin: 0 2.5em; }
   .chapter p.flush { text-indent: 0 !important; }
+  p.code { font-family: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.82em; line-height: 1.5; text-indent: 0 !important; margin: 0 0 0 calc(2em / 0.82); white-space: pre-wrap; overflow-wrap: anywhere; hyphens: none; }
+  p.code:not(p.code + p.code) { margin-top: 0.9em; }
+  p.code:not(:has(+ p.code)) { margin-bottom: 0.9em; }
+  math { display: block math; text-align: center; text-indent: 0; margin: 0.45em 0; font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; font-size: 1.1em; }
+  .mgap { display: inline-block; width: 2em; }
+  .mgap.cap { height: 0; overflow: hidden; visibility: hidden; vertical-align: baseline; }
+  .mgap.cap::before { content: attr(data-cap); }
+  p.flush .mgap, p.poetry .mgap, p[style*="text-align"] .mgap { display: none; }
   ${litrpgCss('.chapter p.litrpg', { size: '0.8em', side: '1.5em', pad: '1em', fill: '#ececec', line: '#a0a0a0', gap: '1.1em' })}
   .chapter p:not(.poetry) + p.poetry, .chapter .hd + p.poetry { margin-top: 0.9em; }
   .chapter p.poetry + p:not(.poetry) { margin-top: 0.9em; }
@@ -765,6 +816,32 @@ ${opts.stamp ? `<p class="prov">${t('{n} words · exported from NEO on {date}', 
 </body></html>`;
 }
 
+// the maths spans runHtml wrote, typeset for a page that is printed or read
+// in a browser (one that can't be read stays as typed)
+const MATH_HTML = /<span class="math" contenteditable="false">([^<]*)<\/span>/g;
+const typesetMathHtml = (html) => html.replace(MATH_HTML, (all, tex) => {
+  const src = tex.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+  return mathMarkup(src) || `<span class="math">${tex}</span>`;
+});
+// the words after a set formula carry on at the paragraph's indent: a gap
+// that wide opens their line (each format's CSS sizes .mgap, and hides it
+// where the paragraph has no indent); none where the paragraph ends. In a
+// chapter's opening paragraph (p.first) the gap carries the drop cap's
+// letters, data-cap, which the CSS sets as a hidden copy of the drop cap, so
+// the words line up with the ones beside it, whatever the letter.
+const mathGapsInner = (inner, cap = '') => inner.replace(/(<\/math>)[ \t]*(?![ \t\n]*$)/g,
+  `$1<span class="mgap${cap ? ` cap" data-cap="${escAttr(cap)}` : ''}"></span>`);
+// the code lines straight after a chapter's opening paragraph, given that
+// paragraph's drop cap letters: each opens with the same hidden copy of the
+// cap, so the block starts where the paragraph's words do beside the cap
+const capCode = (html, cap) => (cap ? html.replace(/^<p class="code([^"]*)">/, `<p class="code$1 capped"><span class="mgap cap" data-cap="${escAttr(cap)}"></span>`) : html);
+const mathGaps = (html) => html.replace(/(<p\b[^>]*>)([\s\S]*?)(<\/p>)/g, (all, open, inner, close) => {
+  if (!inner.includes('</math>')) return all;
+  let cap = '';
+  if (/class="[^"]*\bfirst\b/.test(open)) { const d = document.createElement('div'); d.innerHTML = inner; cap = capLetter(d.textContent); }
+  return open + mathGapsInner(inner, cap) + close;
+});
+
 /* ---------- runs: paragraphs broken into styled text pieces ---------- */
 
 // (characters XML 1.0 forbids, pasted in from a PDF or a terminal, come
@@ -799,6 +876,7 @@ function fnParas(paras, start, mark) {
 function runHtml(r, esc = escHtml) {
   if (r.br) return '<br>';
   if (r.fn !== undefined) return `<span class="fn" data-note="${escAttr(r.fn)}" contenteditable="false">\u200B</span>`;
+  if (r.m) return `<span class="math" contenteditable="false">${esc(r.text)}</span>`;
   let t = esc(r.text);
   if (r.s) t = '<s>' + t + '</s>';
   if (r.u) t = '<u>' + t + '</u>';
@@ -1010,6 +1088,12 @@ function paraRuns(pHtml, flip) {
           runs.push({ fn: child.dataset.note || '', text: '' });
           continue;
         }
+        // inline maths: its LaTeX as one run, marked m (a builder that
+        // doesn't know maths still prints the formula as text)
+        if (child.classList && child.classList.contains('math')) {
+          if (child.textContent) runs.push({ text: child.textContent, m: true, b, i, u, s: x });
+          continue;
+        }
         const tag = child.tagName;
         // a line break inside a paragraph (a chapter file written elsewhere)
         // stays a break, not two words run together
@@ -1040,6 +1124,95 @@ function paraRuns(pHtml, flip) {
 
 /* ---------- DOCX ---------- */
 
+// A formula as a Word equation (OMML), from the MathML it is set in on the
+// page, so Word draws the same maths: null if it can't be read.
+const NARY_OPS = '∑∏∐∫∬∭∮⋃⋂⋁⋀';
+// (the operator itself, or an mrow holding only it, as temml writes a \sum)
+const naryEl = (n) => (n && n.localName === 'mrow' && n.children.length === 1 ? n.children[0] : n);
+const naryOp = (n) => {
+  n = naryEl(n);
+  if (!n || !/^(munderover|munder|mover|msubsup|msub|msup)$/.test(n.localName)) return '';
+  const base = n.children[0];
+  const op = base && base.localName === 'mo' ? base.textContent.trim() : '';
+  return NARY_OPS.includes(op) && op.length === 1 ? op : '';
+};
+function ommlKids(n) {
+  const kids = [...n.children];
+  let out = '';
+  for (let i = 0; i < kids.length; i++) {
+    // a sum or an integral takes what follows it as its body
+    if (naryOp(kids[i])) { out += ommlNode(naryEl(kids[i]), kids[i + 1] ? ommlNode(kids[i + 1]) : ''); i++; } else out += ommlNode(kids[i]);
+  }
+  return out;
+}
+function ommlNode(n, body = '') {
+  const k = [...n.children];
+  const e = (x) => (x ? ommlNode(x) : '');
+  const name = n.localName;
+  if (name === 'mi' || name === 'mn' || name === 'mo' || name === 'mtext') {
+    const text = n.textContent;
+    if (!text) return '';
+    // a one-letter name is italic, as in print; numbers, operators, words upright
+    const upright = name !== 'mi' || [...text].length > 1 || n.getAttribute('mathvariant') === 'normal';
+    return `<m:r>${upright ? '<m:rPr><m:sty m:val="p"/></m:rPr>' : ''}<m:t xml:space="preserve">${escXml(text)}</m:t></m:r>`;
+  }
+  const op = naryOp(n);
+  if (op) {
+    const sub = /under|sub/.test(name) ? k[1] : null;
+    const sup = name === 'munderover' || name === 'msubsup' ? k[2] : name === 'mover' || name === 'msup' ? k[1] : null;
+    const loc = /^mu|^mo/.test(name) ? 'undOvr' : 'subSup';
+    return `<m:nary><m:naryPr><m:chr m:val="${op}"/><m:limLoc m:val="${loc}"/>${sub ? '' : '<m:subHide m:val="1"/>'}${sup ? '' : '<m:supHide m:val="1"/>'}</m:naryPr><m:sub>${e(sub)}</m:sub><m:sup>${e(sup)}</m:sup><m:e>${body}</m:e></m:nary>`;
+  }
+  switch (name) {
+    case 'msup': return `<m:sSup><m:e>${e(k[0])}</m:e><m:sup>${e(k[1])}</m:sup></m:sSup>`;
+    case 'msub': return `<m:sSub><m:e>${e(k[0])}</m:e><m:sub>${e(k[1])}</m:sub></m:sSub>`;
+    case 'msubsup': return `<m:sSubSup><m:e>${e(k[0])}</m:e><m:sub>${e(k[1])}</m:sub><m:sup>${e(k[2])}</m:sup></m:sSubSup>`;
+    case 'mfrac': return `<m:f><m:num>${e(k[0])}</m:num><m:den>${e(k[1])}</m:den></m:f>`;
+    case 'msqrt': return `<m:rad><m:radPr><m:degHide m:val="1"/></m:radPr><m:deg/><m:e>${ommlKids(n)}</m:e></m:rad>`;
+    case 'mroot': return `<m:rad><m:deg>${e(k[1])}</m:deg><m:e>${e(k[0])}</m:e></m:rad>`;
+    case 'munder': return `<m:limLow><m:e>${e(k[0])}</m:e><m:lim>${e(k[1])}</m:lim></m:limLow>`;
+    case 'mover': return `<m:limUpp><m:e>${e(k[0])}</m:e><m:lim>${e(k[1])}</m:lim></m:limUpp>`;
+    case 'munderover': return `<m:limUpp><m:e><m:limLow><m:e>${e(k[0])}</m:e><m:lim>${e(k[1])}</m:lim></m:limLow></m:e><m:lim>${e(k[2])}</m:lim></m:limUpp>`;
+    case 'mtable': return `<m:m>${k.map((tr) => `<m:mr>${[...tr.children].map((td) => `<m:e>${ommlKids(td)}</m:e>`).join('')}</m:mr>`).join('')}</m:m>`;
+    case 'semantics': return e(k[0]);
+    case 'mspace': case 'annotation': case 'annotation-xml': return '';
+    default: return ommlKids(n);
+  }
+}
+function ommlOf(src) {
+  const ml = mathMarkup(src, true);
+  if (!ml) return null;
+  const doc = new DOMParser().parseFromString(ml, 'application/xml');
+  if (doc.getElementsByTagName('parsererror').length) return null;
+  return `<m:oMath>${ommlKids(doc.documentElement)}</m:oMath>`;
+}
+// A paragraph with maths in it, for Word: each formula an equation of its
+// own, centred, as on the page, and the words after it carry on below it
+// at the paragraph's indent. para(runs, opts) sets the words; after(opts) is the
+// paragraph that carries on; eq(omml) the equation's own paragraph.
+function docxMathSplit(runs, opts, para, after, eq) {
+  if (!runs.some((r) => r.m)) return [para(runs, opts)];
+  const out = [];
+  let words = [];
+  let o = opts;
+  const flush = () => {
+    // the words after an equation start their line: no space in front
+    if (out.length && words[0] && words[0].text) words[0] = { ...words[0], text: words[0].text.replace(/^\s+/, '') };
+    if (words.some((r) => (r.text && r.text.trim()) || r.fn !== undefined)) out.push(para(words, o));
+    words = [];
+  };
+  for (const r of runs) {
+    const omml = r.m ? (r.omml || ommlOf(r.text)) : null;
+    if (!omml) { words.push(r); continue; }
+    flush();
+    out.push(eq(omml));
+    o = after(opts);
+  }
+  flush();
+  return out;
+}
+const M_NS = 'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"';
+
 // a Word export's footnotes, gathered as docxP meets them (buildDocxEntries)
 let docxNotes = null;
 function docxP(runs, opts = {}) {
@@ -1048,7 +1221,8 @@ function docxP(runs, opts = {}) {
   if (opts.style) pPr.push(`<w:pStyle w:val="${opts.style}"/>`);
   if (opts.keepNext) pPr.push('<w:keepNext/>');
   if (opts.pageBreak) pPr.push('<w:pageBreakBefore/>');
-  if (opts.spaceBefore || opts.spaceAfter) {
+  if (opts.spacing) pPr.push(opts.spacing);
+  else if (opts.spaceBefore || opts.spaceAfter) {
     pPr.push(`<w:spacing${opts.spaceBefore ? ` w:before="${opts.spaceBefore}"` : ''}${opts.spaceAfter ? ` w:after="${opts.spaceAfter}"` : ''} w:line="${opts.line || 360}" w:lineRule="auto"/>`);
   }
   if (opts.poetry) pPr.push('<w:ind w:left="720" w:right="720"/>');
@@ -1067,7 +1241,7 @@ function docxP(runs, opts = {}) {
     const size = r.size || opts.size;
     // italic and bold are character styles (Emphasis, Strong), so an editor
     // or typesetter can find and restyle them all at once
-    const rStyle = r.b && it ? 'StrongEmphasis' : r.b ? 'Strong' : it ? 'Emphasis' : '';
+    const rStyle = r.m ? 'Maths' : r.b && it ? 'StrongEmphasis' : r.b ? 'Strong' : it ? 'Emphasis' : '';
     // in the order the schema wants them (Word is strict about it)
     const rPr = (rStyle ? `<w:rStyle w:val="${rStyle}"/>` : '')
       + (caps === true ? '<w:caps/>' : caps === false ? '<w:caps w:val="0"/>' : '')
@@ -1079,6 +1253,10 @@ function docxP(runs, opts = {}) {
   }).join('');
   return `<w:p><w:pPr>${pPr.join('')}</w:pPr>${rXml}</w:p>`;
 }
+
+// a paragraph of the book for Word, its formulas set as equations
+const docxMath = (runs, opts) => docxMathSplit(runs, opts, docxP, (o) => o,
+  (omml) => `<w:p><w:pPr><w:pStyle w:val="BodyTextNoIndent"/><w:jc w:val="center"/></w:pPr><m:oMathPara>${omml}</m:oMathPara></w:p>`);
 
 function buildDocxEntries(data) {
   docxNotes = [];
@@ -1158,16 +1336,21 @@ function docxEntriesOf(data) {
         body.push(docxP(paraRuns(p.html), { style: 'LitRPG', keepNext: !end, spaceBefore: top ? 240 : 0, spaceAfter: end ? 240 : 0, line: 240 }));
         return;
       }
+      // a code block breathes above and below, as on the page
+      const edge = (q) => !(q && q.code);
+      const codeSpace = p.code && (edge(ch.paras[i - 1]) || edge(ch.paras[i + 1]))
+        ? `<w:spacing w:before="${edge(ch.paras[i - 1]) ? 180 : 0}" w:after="${edge(ch.paras[i + 1]) ? 180 : 0}" w:line="240" w:lineRule="auto"/>` : '';
       if (p.blank) body.push(docxP([], { style: 'BodyText' }));
       else if (p.sceneBreak) body.push(docxP([{ text: '***' }], { style: 'SceneBreak' }));
-      else if (p.poetry) body.push(docxP(paraRuns(p.html), { style: 'Poetry', align: p.align === 'center' || p.align === 'right' ? p.align : '' }));
-      else if (p.align === 'center' || p.align === 'right') body.push(docxP(paraRuns(p.html), { style: 'BodyTextNoIndent', align: p.align }));
-      else body.push(docxP(paraRuns(p.html), { style: p.flush ? 'BodyTextNoIndent' : 'BodyText' }));
+      else if (p.code) body.push(docxP(p.text ? [{ text: p.text }] : [], { style: 'Code', spacing: codeSpace }));
+      else if (p.poetry) body.push(...docxMath(paraRuns(p.html), { style: 'Poetry', align: p.align === 'center' || p.align === 'right' ? p.align : '' }));
+      else if (p.align === 'center' || p.align === 'right') body.push(...docxMath(paraRuns(p.html), { style: 'BodyTextNoIndent', align: p.align }));
+      else body.push(...docxMath(paraRuns(p.html), { style: p.flush ? 'BodyTextNoIndent' : 'BodyText' }));
     });
   });
   if (!placed) contents();
   const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${body.join('')}
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ${M_NS}><w:body>${body.join('')}
 <w:sectPr>${(window.neo.paper || 'Letter') === 'A4' ? '<w:pgSz w:w="11906" w:h="16838"/>' : '<w:pgSz w:w="12240" w:h="15840"/>'}<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>
 </w:body></w:document>`;
   // the page's own typeface (on Linux, the bundled face it shows)
@@ -1184,6 +1367,7 @@ function docxEntriesOf(data) {
 ${para('BodyText', 'Body Text', '<w:ind w:firstLine="480"/>')}
 ${para('BodyTextNoIndent', 'Body Text No Indent', '', 'BodyText')}
 ${para('Poetry', 'Poetry', '<w:ind w:left="720" w:right="720"/>')}
+${para('Code', 'Code', '<w:spacing w:after="0" w:line="240" w:lineRule="auto"/><w:ind w:left="480"/>', 'Code', '<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="20"/>')}
 ${para('LitRPG', 'LitRPG', LITRPG_DOCX_PPR, 'BodyText', LITRPG_DOCX_RPR)}
 ${para('SceneBreak', 'Scene Break', '<w:spacing w:before="240"/><w:jc w:val="center"/>', 'BodyText')}
 ${para('Title', 'Title', '<w:spacing w:before="3000"/><w:jc w:val="center"/>', 'Normal', '<w:b/><w:sz w:val="56"/>')}
@@ -1193,6 +1377,7 @@ ${[1, 2, 3].map(headingStyle).join('\n')}
 ${chr('Emphasis', 'Emphasis', '<w:i/>')}
 ${chr('Strong', 'Strong', '<w:b/>')}
 ${chr('StrongEmphasis', 'Strong Emphasis', '<w:b/><w:i/>')}
+${chr('Maths', 'Maths', '<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/>')}
 ${para('FootnoteText', 'footnote text', '<w:spacing w:after="0" w:line="240" w:lineRule="auto"/>', 'FootnoteText', '<w:sz w:val="20"/>')}
 ${chr('FootnoteReference', 'footnote reference', '<w:vertAlign w:val="superscript"/>')}
 </w:styles>`;
@@ -1247,7 +1432,7 @@ function chapterXhtml(ch, d) {
   // footnotes: the number is a link a reading app opens as a pop-up note
   let fnN = fnBefore(d, ch);
   const notes = [];
-  const xhtmlRuns = (p) => paraRuns(p.html).map((r) => {
+  const xhtmlRuns = (p) => mathGapsInner(paraRuns(p.html).map((r) => {
     if (r.br) return '<br/>';
     if (p.litrpg && r.text) r = { ...r, text: litrpgSpaces(r.text) };
     if (r.fn !== undefined) {
@@ -1255,17 +1440,19 @@ function chapterXhtml(ch, d) {
       fnN += 1;
       return `<sup class="fnref"><a epub:type="noteref" href="#fn${fnN}" id="fnr${fnN}">${fnN}</a></sup>`;
     }
+    if (r.m) return mathMarkup(r.text, true) || `<code class="math">${escXml(r.text)}</code>`;
     let t = escXml(r.text);
     if (r.s) t = '<s>' + t + '</s>';
     if (r.u) t = '<u>' + t + '</u>';
     if (r.i) t = '<em>' + t + '</em>';
     if (r.b) t = '<strong>' + t + '</strong>';
     return t;
-  }).join('');
+  }).join(''));
   // a page's lines, each set on its own
   const lines = () => ch.paras.map((p, i) => {
     if (p.sceneBreak) return '<p class="brk">* * *</p>';
     if (p.litrpg) return `<p class="${litrpgClass(ch.paras, i)}">${xhtmlRuns(p) || '&#8203;'}</p>`;
+    if (p.code) return `<p class="code">${xhtmlRuns(p)}</p>`;
     const cls = [kind !== 'copyright' && isAttribution(p) ? 'attr' : '', p.poetry ? 'poetry' : '', p.align === 'center' || p.align === 'right' ? p.align : ''].filter(Boolean);
     return `<p${cls.length ? ` class="${cls.join(' ')}"` : ''}>${xhtmlRuns(p)}</p>`;
   }).join('\n');
@@ -1288,6 +1475,7 @@ ${ch.subtitle ? `<p class="sub">${escXml(ch.subtitle)}</p>` : ''}${ch.byline ? `
       if (p.sceneBreak) { first = true; return '<p class="brk">* * *</p>'; }
       if (p.blank) return '<p class="blank">&#160;</p>';
       if (p.litrpg) return `<p class="${litrpgClass(ch.paras, i)}">${xhtmlRuns(p) || '&#8203;'}</p>`;
+      if (p.code) return `<p class="code">${xhtmlRuns(p)}</p>`;
       const classes = [];
       if (p.poetry) classes.push('poetry');
       else if (p.flush) classes.push('flush');
@@ -1337,7 +1525,7 @@ async function buildEpubEntries(data) {
   const start = rest[0] || chapters[0];
   if (!start) throw new Error(t('There’s nothing in this book to export yet'));
   const chItems = chapters.map((ch) =>
-    `<item id="ch${ch.num}" href="ch${ch.num}.xhtml" media-type="application/xhtml+xml"/>`).join('\n');
+    `<item id="ch${ch.num}" href="ch${ch.num}.xhtml" media-type="application/xhtml+xml"${ch.paras.some((p) => (p.runs || []).some((r) => r.m && mathMarkup(r.text))) ? ' properties="mathml"' : ''}/>`).join('\n');
   const spineOf = (list) => list.map((ch) => `<itemref idref="ch${ch.num}"/>`).join('\n');
   // one entry per section for a single book; a book of books nests its
   // chapters under their titles and its titles under their parts
@@ -1432,6 +1620,12 @@ p.right { text-align: right; text-indent: 0; }
 p.brk { text-align: center; text-indent: 0; margin: 2.5em 0; letter-spacing: 0.5em; }
 p.poetry { text-indent: 0; margin: 0 2em; }
 p.flush { text-indent: 0 !important; }
+p.code { font-family: monospace, monospace; font-size: 0.85em; text-indent: 0 !important; text-align: left; margin: 0 0 0 calc(1.2em / 0.85); white-space: pre-wrap; -webkit-hyphens: none; -epub-hyphens: none; hyphens: none; }
+math { display: block; text-align: center; text-indent: 0; margin: 0.45em 0; font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", "Noto Sans Math", "STIX Math", math; }
+code.math { font-family: monospace; font-size: 0.9em; }
+.mgap { display: inline-block; width: 1.2em; }
+p.flush .mgap, p.poetry .mgap, p.center .mgap, p.right .mgap { display: none; }
+:not(.code) + p.code, p.code + :not(.code) { margin-top: 0.9em; }
 p:not(.poetry) + p.poetry, h1 + p.poetry { margin-top: 0.9em; }
 p.poetry + p:not(.poetry) { margin-top: 0.9em; }
 p.byline { text-align: center; text-indent: 0; letter-spacing: 0.2em; text-transform: uppercase; font-size: 0.8em; margin: -1em 0 2em; }
