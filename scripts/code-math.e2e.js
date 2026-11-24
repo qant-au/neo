@@ -377,6 +377,31 @@ test('PDF export finishes', async () => {
   assert.ok(fs.statSync(to).size > 1000);
 });
 
+test('with Code blocks and maths off in Options, ``` ⌘⇧B and $…$ stay plain writing', async () => {
+  await js('library.features.codeMaths = false');
+  try {
+    const last = await js(`${body0}.children.length - 1`);
+    await caretAtEnd(last);
+    await key('Return');
+    await typeKeys('```');
+    await key('Return');
+    let p = await caretPara();
+    assert.equal(p.cls, '');
+    await key('B', [MOD, 'shift']);
+    p = await caretPara();
+    assert.equal(p.cls, '');
+    const before = await js(`${body0}.querySelectorAll('p.code').length`);
+    const maths = await js(`${body0}.querySelectorAll('.math').length`);
+    await typeKeys('Then $x$ and on.');
+    assert.equal(await js(`${body0}.querySelectorAll('p.code').length`), before);
+    assert.equal(await js(`${body0}.querySelectorAll('.math').length`), maths);
+    // and the shortcuts window leaves them out
+    assert.equal(await js('JSON.stringify(bookShortcutSections()).includes("Start or leave a code block")'), false);
+  } finally {
+    await js('library.features.codeMaths = true');
+  }
+});
+
 async function main() {
   await app.whenReady();
   let failed = 0;
